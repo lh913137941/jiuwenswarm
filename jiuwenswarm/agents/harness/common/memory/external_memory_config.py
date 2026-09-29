@@ -94,12 +94,24 @@ def is_external_memory_enabled(config: Optional[Dict[str, Any]] = None) -> bool:
     return bool(get_external_memory_config(config).get("provider"))
 
 
-def _is_cloud_deployment() -> bool:
+def is_cloud_deployment() -> bool:
     """True iff ``OFFICE_ACE_DEPLOYMENT=cloud``（OfficeAce 云服务）。
 
     未设置或其他值视为 PC 端（向后兼容）。
+
+    ``OFFICE_ACE_DEPLOYMENT`` 属于 BUSINESS_MIRROR_KEYS，bare 值在
+    ``ingest_bare_business_into_tip`` 后被从 ``os.environ`` 搬到 per-agent
+    tip 并 pop。因此优先从 ``effective_tip`` 读，``os.environ`` 仅作兜底
+    （bare 尚未被 ingest 的早期阶段）。
     """
-    return os.environ.get("OFFICE_ACE_DEPLOYMENT", "pc").strip().lower() == "cloud"
+    try:
+        from jiuwenswarm.common.local_env_config import effective_tip
+
+        tip_val = str(effective_tip().get("OFFICE_ACE_DEPLOYMENT") or "")
+    except Exception:
+        tip_val = ""
+    val = tip_val or os.environ.get("OFFICE_ACE_DEPLOYMENT", "pc")
+    return val.strip().lower() == "cloud"
 
 
 def get_office_ace_user_profile_config(
@@ -137,7 +149,7 @@ def get_office_ace_user_profile_config(
     user_id = str(ext.get("user_id") or "").strip() or _DEFAULT_USER
 
     # 云端：凭证回落到 AgentArts Memory（与对话上报同源）
-    if _is_cloud_deployment():
+    if is_cloud_deployment():
         if not endpoint:
             endpoint = os.environ.get("AGENTARTS_MEMORY_BASE_URL", "").strip()
         if not api_key:
@@ -146,7 +158,7 @@ def get_office_ace_user_profile_config(
     # space_id：cloud 端 internal 接口 path 需要（/v1/core/internal/spaces/{space_id}/...），
     # pc 端 appapi 接口不需要。优先取 office_ace_user_profile 段，cloud 回落 AGENTARTS_MEMORY_SPACE_ID。
     space_id = str(up.get("space_id") or "").strip()
-    if _is_cloud_deployment() and not space_id:
+    if is_cloud_deployment() and not space_id:
         space_id = os.environ.get("AGENTARTS_MEMORY_SPACE_ID", "").strip()
 
     # 启用条件：external memory 开启 + provider=officeace_cloud + 凭证齐全。

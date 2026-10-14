@@ -75,6 +75,19 @@ def _messages_contain_image_input(messages: Any) -> bool:
     return False
 
 
+def _has_real_finish(value: Any) -> bool:
+    """判定 finish_reason 是否为真实的流结束标记.
+
+    llm_sse_patch 的网关流式格式兼容分支会把「本块尚无 finish_reason」表示
+    成字符串 ``"null"``（见 llm_sse_patch._parse_stream_chunk_gateway_compat），
+    因此不能按 truthy 判定——否则每条网关流的第一个块就会被误认为已正常
+    结束，流不完整检测被整体架空（!7840 后 mf_002 依旧报红的根因）。
+    """
+    if not value:
+        return False
+    return str(value).strip().lower() not in ("null", "none")
+
+
 class ModelResponseGuardRail(DeepAgentRail):
     """对每次模型调用的结果做流完整性 / 空产出校验，失败即抛 MODEL_CALL_FAILED.
 
@@ -114,7 +127,7 @@ class ModelResponseGuardRail(DeepAgentRail):
 
     async def inspect_stream_chunk(self, ctx: AgentCallbackContext, chunk: Any) -> None:
         """记录流中是否出现过 finish_reason（流完整性判定的第一手证据）."""
-        if getattr(chunk, "finish_reason", None):
+        if _has_real_finish(getattr(chunk, "finish_reason", None)):
             self._saw_finish_reason = True
             state = ctx.extra.get(_GUARD_STATE_KEY)
             if isinstance(state, dict):
@@ -136,7 +149,9 @@ class ModelResponseGuardRail(DeepAgentRail):
         saw_finish_reason = self._saw_finish_reason or (
             bool(state.get("saw_finish_reason")) if isinstance(state, dict) else False
         )
-        saw_finish_reason = saw_finish_reason or bool(getattr(response, "finish_reason", None))
+        saw_finish_reason = saw_finish_reason or _has_real_finish(
+            getattr(response, "finish_reason", None)
+        )
 
         content = getattr(response, "content", None) or ""
         reasoning = getattr(response, "reasoning_content", None) or ""

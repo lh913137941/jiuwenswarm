@@ -294,6 +294,7 @@ class AgentManager:
         # 模型热更新后关闭"已被删除/改掉凭证"的 LLM 连接 (增量关闭)。
         self._last_model_conn_configs: dict[tuple, Any] = {}
         self._session_create_tokens: dict[tuple[str, str], tuple[Any, Any]] = {}
+        self._session_create_tokens_by_sid: dict[str, tuple[str, str]] = {}
         self._session_create_token_lock = asyncio.Lock()
         from jiuwenswarm.server.runtime.agent_warm_pool import AgentWarmPool
 
@@ -992,7 +993,24 @@ class AgentManager:
                 )
             if token:
                 self._session_create_tokens[token_key] = (create_signature, claim)
+                if claim.session_id:
+                    self._session_create_tokens_by_sid[claim.session_id] = token_key
             return claim
+
+    def _consume_session_create_token(self, session_id: str | None) -> None:
+        """issue#5240 残余:create_token 幂等窗口到会话激活/释放即结束。
+
+        条目若不弹出,_session_create_tokens 会随会话数永久累积(实测
+        WarmKey/WarmClaim +1 对/会话,连带 claim 载荷 dict/tuple 约 8 obj/会话、
+        受控 +23MB/h)。幂等去重只保护 create RPC 的在途重投;会话已激活或
+        已释放之后的同 token 重投属客户端异常,允许其生成新会话。
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        token_key = self._session_create_tokens_by_sid.pop(sid, None)
+        if token_key is not None:
+            self._session_create_tokens.pop(token_key, None)
 
     async def wait_for_session_prewarm(self, session_id: str | None) -> None:
         if session_id:
@@ -1008,10 +1026,12 @@ class AgentManager:
         """Mark a claimed prewarm workspace as a normal persisted session."""
         if session_id:
             self.warm_pool.clear_marker(session_id)
+        self._consume_session_create_token(session_id)
 
     async def release_session_prewarm_claim(self, session_id: str | None) -> None:
         if session_id:
             await self.warm_pool.release_claim_pin(session_id)
+        self._consume_session_create_token(session_id)
 
     async def get_agent(
             self,
@@ -2146,6 +2166,7 @@ class AgentManager:
         self._agent_create_params.clear()
         self._client_capabilities_by_channel.clear()
         self._session_create_tokens.clear()
+        self._session_create_tokens_by_sid.clear()
         self._agent_borrowers.clear()
         self._agent_pins.clear()
         self._pending_tui_retirements.clear()

@@ -1,6 +1,5 @@
 import asyncio
 import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -165,16 +164,84 @@ async def test_unknown_one_waited_request_and_no_second_report(decision, expecte
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('fail_closed,expected', [
-    (True, PermissionLevel.DENY), (False, PermissionLevel.ALLOW),
+@pytest.mark.parametrize('fail_closed,profile,stored_enabled,expected', [
+    (True, 'default', True, PermissionLevel.ASK),
+    (True, 'full_access', True, PermissionLevel.ALLOW),
+    (True, 'default', False, PermissionLevel.ASK),
+    (True, 'auto_approve', True, PermissionLevel.ASK),
+    (True, None, True, PermissionLevel.ASK),
+    (True, None, False, PermissionLevel.ALLOW),
+    (False, 'default', True, PermissionLevel.ALLOW),
+    (False, 'full_access', True, PermissionLevel.ALLOW),
 ])
-async def test_cloud_unavailable_respects_total_fail_closed_switch(fail_closed, expected):
+async def test_cloud_unavailable_respects_fail_closed_and_effective_profile(
+        fail_closed, profile, stored_enabled, expected):
+    from jiuwenswarm.agents.harness.common.rails.permissions.owner_scopes import (
+        setup_permission_context, cleanup_permission_context,
+    )
+
     b, _ = bridge(decision='unavailable')
     b.config['security'] = {'fail_closed': {'enabled': fail_closed}}
-    b.config['permissions']['permission_mode'] = 'strict'
-    result = await b.decide(raw_event(context(), 'tool.before'), PermissionResult(PermissionLevel.UNDETERMINED))
-    assert result.permission == expected
-    await b.close()
+    b.config['permissions']['enabled'] = stored_enabled
+    token = setup_permission_context(SimpleNamespace(
+        channel_id='xiaoyi' if profile else 'web',
+        metadata={'xiaoyi_permission_profile': profile} if profile else {},
+    ))
+    try:
+        result = await b.decide(raw_event(context(), 'tool.before'), PermissionResult(PermissionLevel.UNDETERMINED))
+        assert result.permission == expected
+    finally:
+        cleanup_permission_context(token)
+        await b.close()
+
+
+def test_behavior_policy_revision_changes_with_request_profile():
+    from jiuwenswarm.agents.harness.common.rails.permissions.owner_scopes import (
+        setup_permission_context, cleanup_permission_context,
+    )
+
+    b, _ = bridge()
+    revisions = []
+    for profile in ('default', 'full_access', 'auto_approve'):
+        token = setup_permission_context(SimpleNamespace(
+            channel_id='xiaoyi', metadata={'xiaoyi_permission_profile': profile},
+        ))
+        try:
+            revisions.append(b.policy_revision())
+        finally:
+            cleanup_permission_context(token)
+    assert len(set(revisions)) == len(revisions)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_request_profiles_do_not_share_unavailable_cloud_decisions():
+    from jiuwenswarm.agents.harness.common.rails.permissions.owner_scopes import (
+        setup_permission_context, cleanup_permission_context,
+    )
+
+    b, events = bridge(decision='unavailable')
+    b.config['security'] = {'fail_closed': {'enabled': True}}
+
+    async def evaluate(profile):
+        token = setup_permission_context(SimpleNamespace(
+            channel_id='xiaoyi', metadata={'xiaoyi_permission_profile': profile},
+        ))
+        try:
+            ctx = context()
+            ctx.extra['behavior.policy_revision'] = b.policy_revision()
+            await asyncio.sleep(0)
+            result = await b.decide(raw_event(ctx, 'tool.before'), PermissionResult(PermissionLevel.UNDETERMINED))
+            return result.permission
+        finally:
+            cleanup_permission_context(token)
+
+    try:
+        results = await asyncio.gather(evaluate('default'), evaluate('full_access'))
+        assert results == [PermissionLevel.ASK, PermissionLevel.ALLOW]
+        assert len(events) == 2
+        assert events[0]['eventId'] != events[1]['eventId']
+    finally:
+        await b.close()
 
 
 @pytest.mark.asyncio
@@ -749,28 +816,46 @@ async def test_actual_builtin_install_checkpoint(tmp_path, monkeypatch, decision
 
 
 @pytest.mark.asyncio
-async def test_desktop_permission_factory_fail_opens_when_cloud_unavailable(monkeypatch):
+@pytest.mark.parametrize('profile,fail_closed,expected', [
+    ('default', True, 'ask'),
+    ('full_access', True, 'allow'),
+    ('default', False, 'allow'),
+])
+async def test_desktop_permission_factory_cloud_unavailable_follows_profile(
+        monkeypatch, profile, fail_closed, expected):
     from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import build_permission_rail
     from jiuwenswarm.agents.harness.common.channel_runtime_context import CURRENT_CHANNEL_ID
+    from jiuwenswarm.agents.harness.common.rails.permissions.owner_scopes import (
+        setup_permission_context, cleanup_permission_context,
+    )
+    from openjiuwen.harness.rails.interrupt.interrupt_base import InterruptResult
+
     monkeypatch.setenv('CLAW_BEHAVIOR_SECURITY', '1')
     monkeypatch.setenv('CLAW_SKILL_TOKEN', 'test-token')
     cfg = {'enabled': True, 'package_builtin_rules': False, 'defaults': {'*': 'allow'}}
     monkeypatch.setattr('jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist.get_permissions_with_session_overlay',
                         lambda **_: cfg.copy())
     b, events = bridge(decision='unavailable')
+    b.config['permissions'] = cfg
+    b.config['security'] = {'fail_closed': {'enabled': fail_closed}}
     ctx = context()
     rail = BehaviorSecurityRail(b)
-    await rail.before_tool_call(ctx)
+    profile_token = setup_permission_context(SimpleNamespace(
+        channel_id='xiaoyi', metadata={'xiaoyi_permission_profile': profile},
+    ))
     channel = CURRENT_CHANNEL_ID.set('desktop')
     try:
+        await rail.before_tool_call(ctx)
         permission = build_permission_rail({**b.config, 'permissions': cfg})
         assert permission is not None
         result = await permission.resolve_interrupt(ctx, ctx.inputs.tool_call, None)
-        assert isinstance(result, ApproveResult)
+        assert isinstance(result, InterruptResult if expected == 'ask' else ApproveResult)
         assert len(events) == 1 and events[0]['mode'] == 'authorize'
     finally:
         CURRENT_CHANNEL_ID.reset(channel)
+        cleanup_permission_context(profile_token)
         await rail.after_tool_call(ctx)
+        await b.close()
 
 
 @pytest.mark.asyncio

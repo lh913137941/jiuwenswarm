@@ -716,7 +716,7 @@ class RuntimePromptRail(DeepAgentRail):
         self.system_prompt_builder.remove_section("tui_current_project_policy")
         self.system_prompt_builder.remove_section("trusted_dirs_policy")
         self.system_prompt_builder.remove_section(SectionName.WORKSPACE)
-        if self._channel in ("tui", "web", "desktop", "ws_client", "__cron__", "cron"):
+        if self._channel in ("tui", "web", "desktop", "ws_client", "xiaoyi", "__cron__", "cron"):
             # This agent's own workspace. Team members each own one; without
             # it (single-agent runs) the process-wide agent workspace is the
             # same directory anyway.
@@ -811,6 +811,7 @@ class RuntimePromptRail(DeepAgentRail):
                     f"| `{agent_workspace_dir}/todo` | Agent 待办目录 | 保存任务和待办状态 | 用于任务状态管理 |\n\n"
                     "以下资源由 小艺 work 提供，路径相对于运行时给出的智能体内部数据目录：\n\n"
                     f"- `IDENTITY.md`：用户为智能体指定的身份信息。绝对路径：`{agent_workspace_dir}/IDENTITY.md`，更新身份时必须写入此绝对路径，不要写入项目目录。\n"
+                    "  当用户设置或修改智能体名称、长期身份时，更新上述 `IDENTITY.md`。\n"
                     "- `skills/`：当前已安装并启用的技能。\n"
                     "- `todo/`：任务和待办状态。\n\n"
                     "目录规则：\n\n"
@@ -867,6 +868,7 @@ class RuntimePromptRail(DeepAgentRail):
                     "The following resources are provided by 小艺 work. Their paths are relative to the "
                     "Agent internal data directory supplied at runtime:\n\n"
                     f"- `IDENTITY.md`: identity information assigned to the Agent by the user. Absolute path: `{agent_workspace_dir}/IDENTITY.md` — when updating identity, write to this absolute path, not the project directory.\n"
+                    "  When the user sets or changes the Agent's name or persistent identity, update the above `IDENTITY.md`.\n"
                     "- `skills/`: currently installed and enabled skills.\n"
                     "- `todo/`: task and to-do state.\n\n"
                     "Directory rules:\n\n"

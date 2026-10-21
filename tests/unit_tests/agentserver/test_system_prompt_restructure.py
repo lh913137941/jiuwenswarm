@@ -1512,6 +1512,44 @@ async def test_runtime_prompt_clears_directory_boundaries_outside_web_and_tui(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("channel", ("desktop", "xiaoyi"))
+@pytest.mark.parametrize(
+    ("language", "update_instruction"),
+    (
+        ("cn", "当用户设置或修改智能体名称、长期身份时，更新上述"),
+        ("en", "When the user sets or changes the Agent's name or persistent identity, update the above"),
+    ),
+)
+async def test_runtime_prompt_exposes_identity_update_guidance(
+    tmp_path, monkeypatch, channel, language, update_instruction,
+):
+    agent_data_dir = tmp_path / "agent-data"
+    project_dir = tmp_path / "project"
+    agent_data_dir.mkdir()
+    project_dir.mkdir()
+    monkeypatch.setattr(_utils_mod, "get_config_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.runtime_prompt_rail.get_agent_workspace_dir",
+        lambda: agent_data_dir,
+    )
+    builder = SystemPromptBuilder(language=language)
+    agent = _FakeAgent(builder)
+    rail = RuntimePromptRail(language=language, channel=channel)
+    rail.init(agent)
+    rail.set_runtime_paths(cwd=str(project_dir), project_dir=str(project_dir))
+    ctx = AgentCallbackContext(
+        agent=agent, inputs=None, session=_FakeSession(), extra={},
+    )
+
+    await rail.before_model_call(ctx)
+
+    prompt = builder.build()
+    assert f"{agent_data_dir}/IDENTITY.md" in prompt
+    assert f"{project_dir}/IDENTITY.md" not in prompt
+    assert update_instruction in prompt
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("channel", ("__cron__", "cron"))
 async def test_runtime_prompt_directory_boundaries_for_cron_channels(
     tmp_path,

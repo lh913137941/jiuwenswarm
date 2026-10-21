@@ -49,8 +49,8 @@ class IdentityRail(DeepAgentRail):
     This ensures the agent always reflects the latest IDENTITY.md state.
 
     Yield rule (expert persona guard): the rail only manages identity sections
-    it recognizes — the default static identity (same factory as
-    ``build_shared_identity_section``) or one installed by itself from
+    it recognizes — the active mode's configured static identity (including
+    private release assets) or one installed by itself from
     IDENTITY.md.  If the current identity section is anything else (e.g. an
     expert persona hot-bound via ``load_agent_template`` with
     ``replace_existing=True``), the rail leaves it untouched: IDENTITY.md is
@@ -64,10 +64,12 @@ class IdentityRail(DeepAgentRail):
             *,
             language: str = "en",
             identity_md_path: str | None = None,
+            default_identity_section: PromptSection | None = None,
     ) -> None:
         super().__init__()
         self._language: str = language
         self._identity_md_path: str | None = identity_md_path
+        self._configured_default_section = default_identity_section
         self._system_prompt_builder = None
         self._default_section: PromptSection | None = None
         # 本 rail 从 IDENTITY.md 装上的 identity section 内容（判等用）；
@@ -86,7 +88,7 @@ class IdentityRail(DeepAgentRail):
                 "[IdentityRail] agent has no system_prompt_builder; disabled"
             )
             return
-        self._default_section = _identity_prompt()
+        self._default_section = self._configured_default_section or _identity_prompt()
         logger.info(
             "[IdentityRail] initialized, identity_md_path=%s language=%s",
             self._resolve_identity_md_path(),
@@ -107,7 +109,7 @@ class IdentityRail(DeepAgentRail):
         """Per-request language switch (cn/en)."""
         if language and language != self._language:
             self._language = language
-            self._default_section = _identity_prompt()
+            self._default_section = self._configured_default_section or _identity_prompt()
 
     def set_identity_md_path(self, path: str | None) -> None:
         """Per-request hot update of the IDENTITY.md file path."""
@@ -159,13 +161,23 @@ class IdentityRail(DeepAgentRail):
 
     def _is_managed_identity(self, section: PromptSection) -> bool:
         """该 identity section 是否归本 rail 管理（默认身份或自己装上的）。"""
+        language = getattr(self._system_prompt_builder, "language", self._language)
+
+        def rendered(content: dict[str, str]) -> str:
+            # ReAct rewraps rendered identity into cn/en and strips its edges.
+            # Compare the effective text, retaining meaningful expert differences.
+            return PromptSection(
+                name=_SECTION_NAME, content=content, priority=_SECTION_PRIORITY,
+            ).render(language).strip()
+
+        current = rendered(section.content)
         if (
                 self._default_section is not None
-                and section.content == self._default_section.content
+                and current == rendered(self._default_section.content)
         ):
             return True
         installed = self._installed_section_content
-        return installed is not None and section.content == installed
+        return installed is not None and current == rendered(installed)
 
     def _resolve_identity_md_path(self) -> Path:
         if self._identity_md_path:

@@ -7,8 +7,8 @@
 | 类型 | spec |
 | 编号 / slug | S_02 / skill-routing-and-registration |
 | 关联模块 | `jiuwenswarm/server/runtime/skill_turbo/`（environment.py、planner.py、skill_meta.py、turbo_package_loader.py、tools_loader.py、skill_turbo_tools.py） |
-| 最近一次修订日期 | 2026-10-13 |
-| 关联 feature | 暂无（首批 specs） |
+| 最近一次修订日期 | 2026-10-21 |
+| 关联 feature | F_03_multi-deliverable-todo-guide.md（其余暂无） |
 
 ## 范围 / 边界
 
@@ -57,6 +57,7 @@
 14. **mtime 计算失败 = 禁用缓存**：`_compute_skill_codes_mtime` 失败返回 0.0，缓存 key 不匹配 → 每次强制重扫。
 15. **enable_for_models 与 vendor_map 互不影响**：前者是 DeepAgent 层 ProgressiveToolRail 的工具懒加载白名单，后者是 thinking 注入的模型白名单（见"接口契约"末节）；新模型接入必须**同时核对两处**。
 16. **PlanGenerationError 是无 raise 点的已导出符号**：定义于 planner.py 并经 `__init__.py` re-export，但当前代码无任何抛出点（plan 失败统一返回 None 走降级）。设计不得假设其被抛出，捕获它属于死代码。
+17. **多交付物待办清单强制引导**：指南（`skill_prompt_rail._build_skill_turbo_guide_text`，中英双语同步）规定：单轮需要多份交付物（多次调用 `skill_acceleration_exec`）时，必须先 `todo_create` 建外层待办清单（每份交付物一项），逐项执行——**串行契约：等 `todo_create` 返回成功后（下一轮）再调用 `skill_acceleration_exec`，逐项推进同理（`todo_modify` 等返回成功再 exec），严禁把清单编排与加速通道放在同一批并行调用**；当前项交付成功后立即 `todo_modify`（action=update）把当前项标 `completed`、下一项标 `in_progress`；清单未清空前不得向用户做最终总结，全部完成后一次性统一总结。架构依据：外层 todo 激活（task_execution_rail `_ACTIVE_TASK_ID` 非空）时入口才走 outer_todo 分支（跳过内部 task.* 事件、chat.* 归外层 todo 步骤 segment，分支见 skill_turbo_tools 入口拦截），无 todo 连跑时各次交付的内部任务互相顶替（实证 case：单轮两份 PPT 无 todo 连跑，交付总结一份被下游分拣丢弃、一份过时补发错位）；**同轮并行 `todo_create` + `skill_acceleration_exec` 还会因 `_ACTIVE_TASK_ID` 尚未设置触发入口 gate 误判 forwarded、turbo Stage 快照顶掉 taskProgress 槽位（竞态实证与机制层兜底见 [[S_08]] 边界 case 21、bugfix/B_03）——串行契约从行为层直接消除该竞态触发路径**。与 N11 互补：N11 约束多次调用的形态（逐个串行），本条约束外层状态编排（先建清单 + 串行推进）。指南成功段与 `_PPT_DELIVERY_SUMMARY_*_HINT` / todo_close_nudge 的"先单独调 `todo_modify` 标 `completed`"措辞契约保持一致，改动须同步三处。
 
 ## 接口契约
 
@@ -278,6 +279,7 @@ HITL resume 不走 planner：直接使用持久化的 `resume_ctx["plan_code"]`�
 - **改 plan_code 形态** → 必同步 [[S_03]] validator 前缀白名单与 `_safe_import`（双重强制），以及 `ensure_packages_for_plan_code` 的 import 正则（[[S_05]]）。
 - **改 send_file 装载** → 必保每请求 remove + add 与请求级 ContextVar 路由；引入任何依赖实例字段的工具前先评估并发覆盖面。
 - **改 query 契约 / 工具描述文案** → 必保 `_render_tool_description` 与指南清单同一次扫描产出（不变量 9）；单任务串行约束在描述与 docstring 双处声明。
+- **改指南规则文案** → 中英双语两分支同步改（`_build_skill_turbo_guide_text` cn/en）；成功段"先单独调 `todo_modify`"与 `_PPT_DELIVERY_SUMMARY_*_HINT`、todo_close_nudge 的措辞契约不得破坏（回归测试：`test_task_execution_todo_close_nudge.py::test_skill_turbo_success_hint_closes_todo_before_summary` + `test_skill_prompt_multi_deliverable_todo.py`）。
 
 ## 与其它 spec 的关系
 

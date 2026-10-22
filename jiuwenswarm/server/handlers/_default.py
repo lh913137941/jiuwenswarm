@@ -946,14 +946,17 @@ async def _handle_stream(
             # return 路径——注册在分支选择之前,分支内 prepare 阶段抛错时,
             # 内层各 finally 尚未建立,注册项只能在这里回收。幂等:未注册或
             # 已注销时 pop 为 no-op(MR#8528 检视:非 tenant 分支 1005-1019
-            # 的 prepare 异常路径曾漏注销)。
+            # 的 prepare 异常路径曾漏注销)。全部取值走 getattr 默认值:
+            # 兜底路径零风险,server 桩/缺属性时静默跳过(telemetry 边界
+            # 单测即用最小桩)。
             current_task = asyncio.current_task()
             sid = str(getattr(request, "session_id", "") or "")
-            entries = ctx.services.session_stream_tasks.get(sid) if sid else None
+            sst = getattr(ctx.services, "session_stream_tasks", None)
+            entries = sst.get(sid) if (sid and sst is not None) else None
             if entries is not None and current_task is not None:
                 entries.pop(current_task, None)
                 if not entries:
-                    ctx.services.session_stream_tasks.pop(sid, None)
+                    sst.pop(sid, None)
             if foreground:
                 await manager.end_foreground_chat()
     finally:

@@ -308,6 +308,7 @@ static int memory_ok(const void *ptr, size_t bytes, int writable) {
 #define ENV_DLL L"JIUWENBOX_SOFT_DELETE_DLL"
 #define ENV_RECYCLE_PORT L"JIUWENBOX_SOFT_DELETE_RECYCLE_PORT"
 #define ENV_RECYCLE_TOKEN L"JIUWENBOX_SOFT_DELETE_RECYCLE_TOKEN"
+#define ENV_TRACE L"JIUWENBOX_SOFT_DELETE_TRACE"
 #define RECYCLE_TOKEN_MAX 256u
 #define RECYCLE_PATH_MAX (48u * 1024u)
 #define PENDING_MAX 1024
@@ -359,6 +360,8 @@ static HMODULE g_module;
 static wchar_t g_self_path[PATH_CAP];
 static CRITICAL_SECTION g_lock;
 static int g_lock_ready;
+/* DllMain holds the loader lock. Do not call msys getenv from that window. */
+static int g_in_dllmain;
 #if defined(__GNUC__)
 #define SOFT_EXPORT __attribute__((dllexport))
 #else
@@ -719,11 +722,100 @@ static int path_exists(const wchar_t *path) {
     return attr != INVALID_FILE_ATTRIBUTES;
 }
 
+typedef char *(*FnMsGetenv)(const char *);
+
+static void normalize_log_env_path(wchar_t *path, size_t cch);
+
+/* Copy one POSIX environ value into out. Matches GetEnvironmentVariableW:
+ * success returns the length without the terminator; a short buffer returns
+ * the required length including the terminator and leaves no usable string. */
+static DWORD copy_posix_env(FnMsGetenv getenv_fn, const char *key, wchar_t *out, DWORD cch) {
+    const char *value;
+    size_t value_len;
+    int wide_n;
+    value = getenv_fn(key);
+    if (value == NULL || value[0] == '\0') {
+        return 0;
+    }
+    value_len = strlen(value);
+    if (value_len == 0 || value_len > 32768) {
+        return 0;
+    }
+    wide_n = MultiByteToWideChar(CP_UTF8, 0, value, (int)value_len, NULL, 0);
+    if (wide_n <= 0) {
+        return 0;
+    }
+    if ((DWORD)wide_n + 1 > cch) {
+        return (DWORD)wide_n + 1;
+    }
+    if (MultiByteToWideChar(CP_UTF8, 0, value, (int)value_len, out, (int)(cch - 1)) != wide_n) {
+        out[0] = L'\0';
+        return 0;
+    }
+    out[wide_n] = L'\0';
+    return (DWORD)wide_n;
+}
+
+/* Win32 environment first. Git Bash keeps JIUWENBOX_* in the MSYS environ of
+ * rm.exe and drops them from the Windows block, so GetEnvironmentVariableW
+ * alone cannot see the recycle port. Fall back to msys/cygwin getenv only
+ * after that miss. A failure here is "unset": the caller keeps its old path
+ * and must not abort the process. */
+static DWORD read_env_w(const wchar_t *key, wchar_t *out, DWORD cch) {
+    DWORD n;
+    HMODULE posix;
+    FnMsGetenv getenv_fn;
+    char key_utf[160];
+    DWORD got = 0;
+    if (out == NULL || cch == 0 || key == NULL || key[0] == L'\0') {
+        return 0;
+    }
+    n = GetEnvironmentVariableW(key, out, cch);
+    if (n > 0) {
+        return n;
+    }
+    out[0] = L'\0';
+    if (g_in_dllmain) {
+        return 0;
+    }
+    posix = GetModuleHandleW(L"msys-2.0.dll");
+    if (posix == NULL) {
+        posix = GetModuleHandleW(L"cygwin1.dll");
+    }
+    if (posix == NULL) {
+        return 0;
+    }
+    getenv_fn = (FnMsGetenv)(void *)GetProcAddress(posix, "getenv");
+    if (getenv_fn == NULL) {
+        return 0;
+    }
+    if (WideCharToMultiByte(CP_UTF8, 0, key, -1, key_utf, (int)sizeof key_utf, NULL, NULL) <= 0) {
+        return 0;
+    }
+#if defined(_MSC_VER)
+    __try {
+        got = copy_posix_env(getenv_fn, key_utf, out, cch);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (cch > 0) {
+            out[0] = L'\0';
+        }
+        got = 0;
+    }
+#else
+    got = copy_posix_env(getenv_fn, key_utf, out, cch);
+#endif
+    return got;
+}
+
 static void read_archive_dir(wchar_t *out, size_t cch) {
-    DWORD n = GetEnvironmentVariableW(ENV_ARCHIVE, out, (DWORD)cch);
+    DWORD n = read_env_w(ENV_ARCHIVE, out, (DWORD)cch);
     if (n == 0 || n >= cch) {
         /* No cwd fallback. A missing setting must not create .trash beside the command. */
         out[0] = L'\0';
+        return;
+    }
+    if (out[0] == L'/') {
+        normalize_log_env_path(out, cch);
     }
 }
 
@@ -1223,7 +1315,7 @@ static FnHtons g_htons_fn;
 /* Set means the sandbox must ask box-server. A bad value still must not fall through. */
 static int recycle_delegation_configured(void) {
     wchar_t buf[2];
-    DWORD n = GetEnvironmentVariableW(ENV_RECYCLE_PORT, buf, 2);
+    DWORD n = read_env_w(ENV_RECYCLE_PORT, buf, 2);
     return n > 0;
 }
 
@@ -1354,7 +1446,7 @@ static int ask_recycle_broker(const wchar_t *dos_path) {
     unsigned short net_port;
     int ok = 0;
 
-    port_n = GetEnvironmentVariableW(ENV_RECYCLE_PORT, port_text, 16);
+    port_n = read_env_w(ENV_RECYCLE_PORT, port_text, 16);
     if (port_n == 0 || port_n >= 16) {
         return 0;
     }
@@ -1362,7 +1454,7 @@ static int ask_recycle_broker(const wchar_t *dos_path) {
     if (port == 0 || !wsa_ready()) {
         return 0;
     }
-    token_n = GetEnvironmentVariableW(ENV_RECYCLE_TOKEN, token_w, RECYCLE_TOKEN_MAX);
+    token_n = read_env_w(ENV_RECYCLE_TOKEN, token_w, RECYCLE_TOKEN_MAX);
     if (token_n == 0 || token_n >= RECYCLE_TOKEN_MAX) {
         return 0;
     }
@@ -1441,6 +1533,13 @@ static int soft_delete_path(const wchar_t *dos_path) {
     if (is_skipped_path(dos_path)) {
         t_bypass = 0;
         return 0;
+    }
+    {
+        wchar_t msg[1200];
+        swprintf_s(
+            msg, 1200, L"posix-debug: delete candidate recycle=%d path=%s",
+            recycle_delegation_configured(), dos_path);
+        log_line(msg);
     }
     /* Sandbox deletes are recycled by box-server. Failure keeps the file.
      * Expand here: box-server's current directory is not this command's. */
@@ -1594,6 +1693,7 @@ static int resolve_soft_log_path(wchar_t *out, size_t cch) {
             if (home_n == 0 || home_n >= 900) {
                 return 0;
             }
+            normalize_log_env_path(data_dir, 1024);
             if (swprintf_s(log_dir, 1024, L"%s\\.jiuwenswarm\\logs", data_dir) < 0) {
                 return 0;
             }
@@ -1623,24 +1723,13 @@ static int resolve_soft_log_path(wchar_t *out, size_t cch) {
     return swprintf_s(out, cch, L"%s\\%s\\full.log", log_dir, day) > 0;
 }
 
-static void log_line(const wchar_t *text) {
-    wchar_t path[1024];
+static void append_utf8_file(const wchar_t *path, const char *prefix, const char *body) {
     wchar_t parent[1024];
     wchar_t *slash;
     HANDLE file;
     DWORD written = 0;
-    char utf8[2048];
-    char prefix[160];
-    int n;
     int saved_bypass;
-    SYSTEMTIME st;
-    if (text == NULL) {
-        return;
-    }
-    OutputDebugStringW(L"[soft_delete] ");
-    OutputDebugStringW(text);
-    OutputDebugStringW(L"\n");
-    if (!resolve_soft_log_path(path, 1024)) {
+    if (path == NULL || path[0] == L'\0') {
         return;
     }
     if (swprintf_s(parent, 1024, L"%s", path) < 0) {
@@ -1658,35 +1747,110 @@ static void log_line(const wchar_t *text) {
         return;
     }
     file = CreateFileW(
-        path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        path, FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     t_bypass = saved_bypass;
     if (file == INVALID_HANDLE_VALUE) {
-        static LONG open_failed = 0;
-        if (InterlockedCompareExchange(&open_failed, 1, 0) == 0) {
-            wchar_t msg[1200];
-            swprintf_s(msg, 1200, L"[soft_delete] log open failed winerror=%lu path=%s", GetLastError(), path);
-            OutputDebugStringW(msg);
-            OutputDebugStringW(L"\n");
-        }
         return;
     }
+    if (prefix != NULL && prefix[0] != '\0') {
+        WriteFile(file, prefix, (DWORD)strlen(prefix), &written, NULL);
+    }
+    if (body != NULL && body[0] != '\0') {
+        WriteFile(file, body, (DWORD)strlen(body), &written, NULL);
+    }
+    WriteFile(file, "\r\n", 2, &written, NULL);
+    FlushFileBuffers(file);
+    CloseHandle(file);
+}
+
+static void append_trace(const char *prefix, const char *body) {
+    wchar_t path[1024];
+    DWORD n = read_env_w(ENV_TRACE, path, 1024);
+    if (n == 0 || n >= 1024) {
+        return;
+    }
+    /* rm.exe 里 msys-2.0.dll 会先把 C:\... 改成 /c/...。不转回来则路径里没有
+     * 反斜杠，append_utf8_file 直接返回，hooks installed 进不了跟踪文件。 */
+    normalize_log_env_path(path, 1024);
+    append_utf8_file(path, prefix, body);
+}
+
+static void log_line(const wchar_t *text) {
+    wchar_t path[1024];
+    char utf8[2048];
+    char prefix[160];
+    int n;
+    int wrote_host = 0;
+    SYSTEMTIME st;
+    if (text == NULL) {
+        return;
+    }
+    OutputDebugStringW(L"[soft_delete] ");
+    OutputDebugStringW(text);
+    OutputDebugStringW(L"\n");
     GetLocalTime(&st);
     n = sprintf_s(
         prefix, sizeof prefix,
         "%04u-%02u-%02u %02u:%02u:%02u.%03u INFO soft_delete softdelete.c:0: [soft_delete] pid=%lu ",
         st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
         st.wMilliseconds, GetCurrentProcessId());
-    if (n > 0) {
-        WriteFile(file, prefix, (DWORD)n, &written, NULL);
+    if (n < 0) {
+        prefix[0] = '\0';
     }
     n = WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, (int)sizeof utf8, NULL, NULL);
-    if (n > 1) {
-        WriteFile(file, utf8, (DWORD)(n - 1), &written, NULL);
+    if (n <= 1) {
+        utf8[0] = '\0';
     }
-    WriteFile(file, "\r\n", 2, &written, NULL);
-    FlushFileBuffers(file);
-    CloseHandle(file);
+    if (resolve_soft_log_path(path, 1024)) {
+        wchar_t parent[1024];
+        wchar_t *slash;
+        HANDLE file;
+        DWORD written = 0;
+        int saved_bypass;
+        if (swprintf_s(parent, 1024, L"%s", path) >= 0) {
+            slash = wcsrchr(parent, L'\\');
+            if (slash != NULL) {
+                *slash = L'\0';
+                saved_bypass = t_bypass;
+                t_bypass = 1;
+                if (ensure_dir(parent)) {
+                    file = CreateFileW(
+                        path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                    t_bypass = saved_bypass;
+                    if (file != INVALID_HANDLE_VALUE) {
+                        if (prefix[0] != '\0') {
+                            WriteFile(file, prefix, (DWORD)strlen(prefix), &written, NULL);
+                        }
+                        if (utf8[0] != '\0') {
+                            WriteFile(file, utf8, (DWORD)strlen(utf8), &written, NULL);
+                        }
+                        WriteFile(file, "\r\n", 2, &written, NULL);
+                        FlushFileBuffers(file);
+                        CloseHandle(file);
+                        wrote_host = 1;
+                    }
+                } else {
+                    t_bypass = saved_bypass;
+                }
+            }
+        }
+    }
+    /* 沙箱用户经常写不了宿主 full.log. 跟踪文件由 runner 转发进 full.log. */
+    append_trace(prefix, utf8);
+    if (!wrote_host) {
+        static LONG host_log_failed = 0;
+        if (InterlockedCompareExchange(&host_log_failed, 1, 0) == 0) {
+            char note[1600];
+            sprintf_s(
+                note, sizeof note,
+                "posix-debug: host full.log not writable pid=%lu",
+                GetCurrentProcessId());
+            append_trace("", note);
+        }
+    }
 }
 
 static void log_win(const wchar_t *api, DWORD err, DWORD pid, const wchar_t *detail) {
@@ -2627,12 +2791,47 @@ static int created_image_skip_inject(HANDLE process, HANDLE file) {
     return image_is_posix(bare);
 }
 
+static void debug_process_image_path(HANDLE process, HANDLE file, wchar_t *path, DWORD cap) {
+    DWORD n;
+    if (path == NULL || cap < 2) {
+        return;
+    }
+    path[0] = L'\0';
+    if (file != NULL) {
+        n = GetFinalPathNameByHandleW(file, path, cap, 0);
+        if (n == 0 || n >= cap) {
+            path[0] = L'\0';
+        }
+    }
+    if (path[0] == L'\0' && process != NULL) {
+        DWORD name_cap = cap;
+        if (!QueryFullProcessImageNameW(process, 0, path, &name_cap)) {
+            path[0] = L'\0';
+        }
+    }
+    if (wcsncmp(path, L"\\\\?\\", 4) == 0 && path[4] != L'\0') {
+        wcscpy_s(path, cap, path + 4);
+    }
+}
+
 static void on_debug_create(DebugTree *tree, DEBUG_EVENT *ev) {
     CREATE_PROCESS_DEBUG_INFO *info = &ev->u.CreateProcessInfo;
-    int skip = created_image_skip_inject(info->hProcess, info->hFile);
+    wchar_t image[1024];
+    wchar_t msg[1200];
+    int skip;
+    debug_process_image_path(info->hProcess, info->hFile, image, 1024);
+    skip = created_image_skip_inject(info->hProcess, info->hFile);
+    swprintf_s(
+        msg, 1200, L"posix-debug: CREATE pid=%lu skip_inject=%d live_after=%d image=%s",
+        ev->dwProcessId, skip, tree->live + 1, image[0] != L'\0' ? image : L"(unknown)");
+    log_line(msg);
     tree->live += 1;
     if (!skip && !remember_debug_child(tree, ev->dwProcessId, info->hProcess, info->hThread)) {
+        log_line(L"posix-debug: remember_debug_child failed, child continues without the DLL");
         log_line(L"softdelete: debug child was not hooked, it continues without the DLL");
+    } else if (!skip) {
+        swprintf_s(msg, 1200, L"posix-debug: armed breakpoint inject pid=%lu", ev->dwProcessId);
+        log_line(msg);
     }
     close_create_handles(info);
 }
@@ -2655,6 +2854,7 @@ static int inject_at_breakpoint(DebugChild *slot, DEBUG_EVENT *held) {
     int resumed = 0;
     BOOL wow = FALSE;
     FARPROC load_library;
+    wchar_t msg[1200];
     memset(&ctx, 0, sizeof ctx);
     ctx.ContextFlags = CONTEXT_FULL;
     thread = slot->thread;
@@ -2710,6 +2910,9 @@ static int inject_at_breakpoint(DebugChild *slot, DEBUG_EVENT *held) {
     slot->remote = remote;
     slot->started = GetTickCount();
     slot->injecting = 1;
+    swprintf_s(
+        msg, 1200, L"posix-debug: breakpoint inject started pid=%lu", held->dwProcessId);
+    log_line(msg);
     return 1;
 stop_child:
     if (suspended && !resumed && thread != NULL) {
@@ -2725,12 +2928,21 @@ stop_child:
         CloseHandle(opened);
     }
     close_debug_child_handles(slot);
+    swprintf_s(
+        msg, 1200, L"posix-debug: breakpoint inject failed pid=%lu", held->dwProcessId);
+    log_line(msg);
     log_line(L"softdelete: breakpoint inject failed, child continues without the DLL");
     return 1;
 }
 
 static void finish_debug_inject(DebugChild *slot, int ok) {
-    if (!ok) {
+    wchar_t msg[128];
+    if (ok) {
+        swprintf_s(msg, 128, L"posix-debug: breakpoint inject ok pid=%lu", slot->pid);
+        log_line(msg);
+    } else {
+        swprintf_s(msg, 128, L"posix-debug: breakpoint inject timeout pid=%lu", slot->pid);
+        log_line(msg);
         log_line(L"softdelete: breakpoint inject failed, child continues without the DLL");
     }
     close_debug_child_handles(slot);
@@ -2836,12 +3048,24 @@ typedef struct PosixStart {
     HANDLE created;
 } PosixStart;
 
+static void log_posix_recycle_env(void) {
+    wchar_t port[32];
+    wchar_t msg[160];
+    DWORD n = GetEnvironmentVariableW(ENV_RECYCLE_PORT, port, 32);
+    swprintf_s(
+        msg, 160, L"posix-debug: debugger thread RECYCLE_PORT=%s",
+        (n > 0 && n < 32) ? port : L"(unset)");
+    log_line(msg);
+}
+
 static DWORD WINAPI posix_debug_thread(LPVOID arg) {
     PosixStart *req = (PosixStart *)arg;
     DebugTree tree;
     PROCESS_INFORMATION *pi;
     DWORD used;
+    wchar_t msg[1200];
     memset(&tree, 0, sizeof tree);
+    log_posix_recycle_env();
     used = req->flags | DEBUG_PROCESS;
     t_worker_creating = 1;
     if (req->token == NULL) {
@@ -2861,12 +3085,21 @@ static DWORD WINAPI posix_debug_thread(LPVOID arg) {
         if (req->error == 0) {
             req->error = ERROR_INVALID_PARAMETER;
         }
+        swprintf_s(
+            msg, 1200,
+            L"posix-debug: CreateProcess(DEBUG) failed winerror=%lu as_user=%d",
+            req->error, req->token != NULL);
+        log_line(msg);
         SetEvent(req->created);
         return 0;
     }
     /* This call requires a debugging connection, established above. */
     DebugSetProcessKillOnExit(FALSE);
     tree.root_pid = pi->dwProcessId;
+    swprintf_s(
+        msg, 1200, L"posix-debug: bash root started pid=%lu flags=0x%lx",
+        pi->dwProcessId, (unsigned long)used);
+    log_line(msg);
     if (!DuplicateHandle(
             GetCurrentProcess(), pi->hProcess, GetCurrentProcess(), &tree.root_process,
             0, FALSE, DUPLICATE_SAME_ACCESS)) {
@@ -2875,6 +3108,7 @@ static DWORD WINAPI posix_debug_thread(LPVOID arg) {
         log_win(
             L"DuplicateHandle", GetLastError(), pi->dwProcessId,
             L"bash continues without debug inject");
+        log_line(L"posix-debug: DuplicateHandle(root) failed, debug tree aborted");
         DebugActiveProcessStop(pi->dwProcessId);
         req->ok = TRUE;
         req->error = 0;
@@ -2893,6 +3127,9 @@ static DWORD WINAPI posix_debug_thread(LPVOID arg) {
         }
     }
     poll_debug_injects(&tree);
+    swprintf_s(
+        msg, 1200, L"posix-debug: debug tree finished root_pid=%lu", tree.root_pid);
+    log_line(msg);
     CloseHandle(tree.root_process);
     return 0;
 }
@@ -2922,10 +3159,12 @@ static BOOL submit_posix_create(
     req.pi_out = pi;
     req.created = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (req.created == NULL) {
+        log_line(L"posix-debug: submit_posix_create CreateEvent failed");
         return FALSE;
     }
     thread = CreateThread(NULL, 0, posix_debug_thread, &req, 0, NULL);
     if (thread == NULL) {
+        log_win(L"CreateThread", GetLastError(), 0, L"posix-debug: submit_posix_create");
         CloseHandle(req.created);
         return FALSE;
     }
@@ -2935,10 +3174,14 @@ static BOOL submit_posix_create(
     CloseHandle(thread);
     CloseHandle(req.created);
     if (which != WAIT_OBJECT_0) {
+        log_line(L"posix-debug: submit_posix_create wait ended on debug thread exit, not bash ready");
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
     }
     if (!req.ok) {
+        wchar_t msg[128];
+        swprintf_s(msg, 128, L"posix-debug: submit_posix_create failed winerror=%lu", req.error);
+        log_line(msg);
         SetLastError(req.error);
     }
     return req.ok;
@@ -3011,7 +3254,7 @@ static wchar_t *ansi_env_to_wide(const char *block) {
  * Do not copy the rest of the parent's environment into a custom block. */
 static wchar_t *merge_child_soft_env(const wchar_t *block, int *ok) {
     static const wchar_t *keys[] = {
-        ENV_ENABLED, ENV_ARCHIVE, ENV_DLL, ENV_RECYCLE_PORT, ENV_RECYCLE_TOKEN,
+        ENV_ENABLED, ENV_ARCHIVE, ENV_DLL, ENV_RECYCLE_PORT, ENV_RECYCLE_TOKEN, ENV_TRACE,
         L"SystemRoot",
         L"JIUWENSWARM_LOG_DIR", L"JIUWENSWARM_LOG_DATE_ROOT", L"JIUWENSWARM_DATA_DIR",
     };
@@ -3074,6 +3317,20 @@ static wchar_t *merge_child_soft_env(const wchar_t *block, int *ok) {
     return out;
 }
 
+static void log_create_route(const wchar_t *decision, LPCWSTR app, LPCWSTR cmd) {
+    wchar_t image[1024];
+    wchar_t msg[1400];
+    if (!resolve_child_image(app, cmd, image, 1024)) {
+        image[0] = L'\0';
+    }
+    swprintf_s(
+        msg, 1400, L"posix-debug: route %s pid=%lu image=%s",
+        decision != NULL ? decision : L"?",
+        GetCurrentProcessId(),
+        image[0] != L'\0' ? image : L"(unresolved)");
+    log_line(msg);
+}
+
 static BOOL WINAPI hook_CreateProcessInternalW(
     HANDLE token, LPCWSTR app, LPWSTR cmd, LPSECURITY_ATTRIBUTES process_attr,
     LPSECURITY_ATTRIBUTES thread_attr, BOOL inherit, DWORD flags, LPVOID env,
@@ -3087,6 +3344,8 @@ static BOOL WINAPI hook_CreateProcessInternalW(
     const wchar_t *wide_env;
     LPVOID use_env = env;
     if (t_worker_creating || parent_is_posix_runtime()) {
+        log_create_route(
+            t_worker_creating ? L"bypass-worker" : L"bypass-posix-parent", app, cmd);
         return g_create_process(
             token, app, cmd, process_attr, thread_attr, inherit, flags, env, cwd, startup, pi,
             new_token);
@@ -3126,9 +3385,25 @@ static BOOL WINAPI hook_CreateProcessInternalW(
         }
     }
     if (child_is_posix_image(app, cmd)) {
+        wchar_t posix_image[1024];
+        wchar_t posix_msg[1100];
+        if (resolve_child_image(app, cmd, posix_image, 1024)) {
+            swprintf_s(
+                posix_msg, 1100, L"posix-debug: hook routing bash image=%s", posix_image);
+            log_line(posix_msg);
+        } else {
+            log_line(L"posix-debug: hook routing bash image=(unresolved)");
+        }
         ok = submit_posix_create(
             token, app, cmd, process_attr, thread_attr, inherit, used, use_env, cwd, startup, pi);
+        if (ok && pi != NULL && pi->dwProcessId != 0) {
+            swprintf_s(
+                posix_msg, 1100, L"posix-debug: submit_posix_create ok bash_pid=%lu",
+                pi->dwProcessId);
+            log_line(posix_msg);
+        }
         if (!ok) {
+            log_line(L"posix-debug: submit_posix_create failed, falling back");
             log_line(L"softdelete: debug start failed; starting bash without soft-delete");
             if (pi->hProcess == NULL) {
                 ok = g_create_process(
@@ -3145,6 +3420,7 @@ static BOOL WINAPI hook_CreateProcessInternalW(
     {
         wchar_t image[1024];
         if (resolve_child_image(app, cmd, image, 1024) && image_skip_inject(image)) {
+            log_create_route(L"skip-inject", app, cmd);
             ok = g_create_process(
                 token, app, cmd, process_attr, thread_attr, inherit, used, use_env, cwd, startup, pi,
                 new_token);
@@ -3156,17 +3432,27 @@ static BOOL WINAPI hook_CreateProcessInternalW(
         used |= CREATE_SUSPENDED;
         added_suspend = 1;
     }
+    log_create_route(L"suspend-inject", app, cmd);
     ok = g_create_process(
         token, app, cmd, process_attr, thread_attr, inherit, used, use_env, cwd, startup, pi,
         new_token);
     HeapFree(GetProcessHeap(), 0, owned_env);
     if (!ok || pi == NULL || pi->hProcess == NULL) {
+        wchar_t msg[256];
+        swprintf_s(
+            msg, 256, L"posix-debug: create failed winerror=%lu pid=%lu",
+            GetLastError(), GetCurrentProcessId());
+        log_line(msg);
         return ok;
     }
     if (!inject_dll(pi->hProcess, pi->hThread)) {
         log_win(
             L"inject_dll", GetLastError(), pi->dwProcessId,
             L"child continues without the soft-delete DLL");
+    } else {
+        wchar_t msg[256];
+        swprintf_s(msg, 256, L"posix-debug: inject_dll ok child_pid=%lu", pi->dwProcessId);
+        log_line(msg);
     }
     if (added_suspend) {
         DWORD resumed = ResumeThread(pi->hThread);
@@ -3296,6 +3582,7 @@ static void write_load_error(const wchar_t *text) {
     if (GetTempPathW(MAX_PATH, dir) == 0) {
         return;
     }
+    normalize_log_env_path(dir, MAX_PATH);
     if (swprintf_s(path, MAX_PATH, L"%sjiuwen-softdelete-error.txt", dir) < 0) {
         return;
     }
@@ -3436,6 +3723,7 @@ static int patch_only_process(void) {
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         int static_load;
+        g_in_dllmain = 1;
         g_tls_slot = TlsAlloc();
         g_module = instance;
         {
@@ -3447,6 +3735,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         /* The supervisor loads this DLL only to call the patch export.
          * Installing hooks here would soft-delete the supervisor itself. */
         if (patch_only_process()) {
+            g_in_dllmain = 0;
             return TRUE;
         }
         DisableThreadLibraryCalls(instance);
@@ -3477,12 +3766,24 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
                         g_lock_ready = 0;
                     }
                     /* Dynamic LoadLibrary: unload this DLL. Callers keep running. */
+                    g_in_dllmain = 0;
                     return FALSE;
                 }
                 /* Import-table load: returning FALSE would abort the child. */
                 log_line(L"softdelete: hook install failed during import load; process continues without soft-delete");
+            } else {
+                wchar_t exe[1024];
+                wchar_t msg[1400];
+                if (GetModuleFileNameW(NULL, exe, 1024) == 0) {
+                    exe[0] = L'\0';
+                }
+                swprintf_s(
+                    msg, 1400, L"posix-debug: hooks installed pid=%lu exe=%s",
+                    GetCurrentProcessId(), exe[0] != L'\0' ? exe : L"(unknown)");
+                log_line(msg);
             }
         }
+        g_in_dllmain = 0;
     } else if (reason == DLL_PROCESS_DETACH && reserved == NULL) {
         remove_hooks();
         if (g_lock_ready) {

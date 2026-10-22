@@ -3489,8 +3489,27 @@ class ProcessRuntime(RuntimeAdapter):
             detach_runner_recycle,
             prepare_runner_recycle,
         )
+        from jiuwenbox.supervisor.win_softdelete import merge_soft_delete_spawn_env
+
+        merge_soft_delete_spawn_env(env)
+        # 跟踪文件放在 jbx-sandbox 自己的 profile 下. DLL 写这里, runner 再转发到 full.log.
+        # 不能放宿主日志目录: 沙箱用户对那目录经常没有写权限, 诊断会静默丢失.
+        _sys_drive = os.environ.get("SystemDrive", r"C:").rstrip("\\") + "\\"
+        env["JIUWENBOX_SOFT_DELETE_TRACE"] = os.path.join(
+            _sys_drive, "Users", "jbx-sandbox", "jiuwenbox-logs", sandbox_id, "softdelete-trace.log",
+        )
         recycle_token = prepare_runner_recycle(
             env, [workspace, *(allow_write_paths or [])],
+        )
+        # prepare_runner_recycle 只写 port/token; 再合并一次保证 ENABLED/DLL/ARCHIVE 进 runner 块.
+        merge_soft_delete_spawn_env(env)
+        logger.info(
+            "[SandboxWin] %s soft-delete spawn env enabled=%s recycle_port=%s dll=%s trace=%s",
+            sandbox_id,
+            env.get("JIUWENBOX_SOFT_DELETE", "(missing)"),
+            env.get("JIUWENBOX_SOFT_DELETE_RECYCLE_PORT", "(missing)"),
+            "set" if env.get("JIUWENBOX_SOFT_DELETE_DLL") else "(missing)",
+            env.get("JIUWENBOX_SOFT_DELETE_TRACE", "(missing)"),
         )
         try:
             # No resource limits: the Job is solely an owner-death safety net.

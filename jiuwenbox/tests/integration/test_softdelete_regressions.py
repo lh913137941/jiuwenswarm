@@ -236,3 +236,43 @@ def test_invalid_token_keeps_source(tmp_path, dll, broker):
     assert result.returncode != 0 and "PermissionError" in result.stderr
     assert victim.read_text() == "keep me"
     assert not requests and not archive.exists()
+
+
+def _win_to_msys(path: Path) -> str:
+    resolved = path.resolve()
+    drive = resolved.drive.rstrip(":").lower()
+    rest = str(resolved)[len(resolved.drive):].replace("\\", "/")
+    return f"/{drive}{rest}"
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="Git Bash rm spawns rm.exe but debug inject does not delegate to broker yet",
+)
+def test_bash_rm_delegates_to_recycle_broker(tmp_path, dll, broker):
+    """Regression guard: bash rm must hit the same broker path as python os.remove."""
+    _server, env, archive, requests = broker
+    victim = tmp_path / "bash-rm.txt"
+    victim.write_text("bash rm payload")
+    msys_path = _win_to_msys(victim)
+    git = shutil.which("git")
+    if not git:
+        pytest.skip("requires Git Bash")
+    bash = Path(git).parent.parent / "usr" / "bin" / "bash.exe"
+    if not bash.is_file():
+        pytest.skip(f"requires {bash}")
+    host = tmp_path / "host.py"
+    host.write_text(
+        "import ctypes,subprocess,sys\n"
+        f"ctypes.WinDLL({str(dll)!r})\n"
+        f"bash={str(bash)!r}\n"
+        f"cmd=f'rm -f {msys_path!r}'\n"
+        "sys.exit(subprocess.run([bash,'-lc',cmd],timeout=30).returncode)\n",
+        encoding="utf-8",
+    )
+    result = run_child([sys.executable, str(host)], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not victim.exists()
+    assert requests == [str(victim)]
+    files = list(archive.glob("bash-rm.txt_*"))
+    assert len(files) == 1 and files[0].read_text() == "bash rm payload"

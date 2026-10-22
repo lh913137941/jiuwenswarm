@@ -386,6 +386,191 @@ def connector_host_argv(
     return [str(exe), *tokens[1:]]
 
 
+# 复合命令出沙箱时，除连接器 CLI 外只允许这些只读探测/格式化命令。
+_HOST_HELPERS = frozenset({
+    "jq",
+    "which",
+    "where",
+    "echo",
+    "type",
+    "command",
+    "get-command",
+    "select-object",
+})
+_NULL_REDIRECTS = frozenset({"/dev/null", "nul"})
+_REDIRECT_TOKEN = re.compile(r"^(?P<fd>\d*)(?P<op>>{1,2})(?P<target>.*)$")
+
+
+def _host_quote(token: str, *, posix: bool) -> str:
+    if posix:
+        return shlex.quote(token)
+    if token and not any(char.isspace() or char in "\"'`$" for char in token):
+        return token
+    return "'" + token.replace("'", "''") + "'"
+
+
+def _split_host_segments(command: str) -> list[tuple[str, str]] | None:
+    """按引号外的 ``|`` / ``&&`` / ``||`` 切开。`;`、后台 ``&``、换行和命令替换拒绝。"""
+    parts: list[tuple[str, str]] = []
+    buf: list[str] = []
+    quote: str | None = None
+    index = 0
+    separator = ""
+    while index < len(command):
+        char = command[index]
+        if quote is None and char == "\\":
+            buf.append(char)
+            if index + 1 < len(command):
+                buf.append(command[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if char in {'"', "'"} and quote in {None, char}:
+            quote = None if quote == char else char
+            buf.append(char)
+            index += 1
+            continue
+        if quote == "'":
+            buf.append(char)
+            index += 1
+            continue
+        if char == "`" or (
+            char == "$" and index + 1 < len(command) and command[index + 1] == "("
+        ):
+            return None
+        if quote is None and char in "\n\r;":
+            return None
+        if quote is None and char == "&":
+            if not command.startswith("&&", index):
+                return None
+            segment = "".join(buf).strip()
+            if not segment:
+                return None
+            parts.append((separator, segment))
+            buf = []
+            separator = "&&"
+            index += 2
+            continue
+        if quote is None and char == "|":
+            operator = "||" if command.startswith("||", index) else "|"
+            segment = "".join(buf).strip()
+            if not segment:
+                return None
+            parts.append((separator, segment))
+            buf = []
+            separator = operator
+            index += len(operator)
+            continue
+        buf.append(char)
+        index += 1
+    if quote is not None:
+        return None
+    segment = "".join(buf).strip()
+    if not segment:
+        return None
+    parts.append((separator, segment))
+    return parts
+
+
+def _segment_command(segment: str) -> tuple[list[str], list[str]] | None:
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        return None
+    argv: list[str] = []
+    redirects: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"<", "<<"} or token.startswith("<"):
+            return None
+        matched = _REDIRECT_TOKEN.match(token)
+        target = ""
+        fd = ""
+        if matched and matched.group("op"):
+            if matched.group("op") != ">":
+                return None
+            fd = matched.group("fd") or ""
+            target = matched.group("target")
+            if not target:
+                index += 1
+                if index >= len(tokens):
+                    return None
+                target = tokens[index]
+        elif token in {">", "1>", "2>"}:
+            fd = "" if token == ">" else token[:-1]
+            index += 1
+            if index >= len(tokens):
+                return None
+            target = tokens[index]
+        if target:
+            if target.lower() not in _NULL_REDIRECTS:
+                return None
+            sink = "/dev/null" if target.startswith("/") else "NUL"
+            redirects.append(f"{fd}>{sink}")
+            index += 1
+            continue
+        argv.append(token)
+        index += 1
+    if not argv or _ENV_ASSIGN.match(argv[0]):
+        return None
+    return argv, redirects
+
+
+_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def render_connector_host_invocation(
+    command: str,
+    *,
+    posix: bool,
+    connectors_dir: Path | None = None,
+) -> list[str] | str | None:
+    """把连接器复合命令收成直接 argv 或已校验脚本。危险写法返回 None。"""
+    parts = _split_host_segments(str(command or "").strip())
+    if not parts:
+        return None
+    rendered: list[str] = []
+    for separator, segment in parts:
+        parsed = _segment_command(segment)
+        if parsed is None:
+            return None
+        argv, redirects = parsed
+        base = cli_basename(argv[0])
+        if not (
+            is_connector_cli_name(argv[0], connectors_dir=connectors_dir)
+            or base in _HOST_HELPERS
+        ):
+            return None
+        if base == "command" and (len(argv) < 2 or argv[1] not in {"-v", "-V"}):
+            return None
+        if (
+            len(parts) == 1
+            and not redirects
+            and is_connector_cli_name(argv[0], connectors_dir=connectors_dir)
+        ):
+            exe = resolve_connector_executable(argv[0], connectors_dir=connectors_dir)
+            if exe is not None:
+                return [str(exe), *argv[1:]]
+        words: list[str] = []
+        for token in argv:
+            if is_connector_cli_name(token, connectors_dir=connectors_dir):
+                exe = resolve_connector_executable(token, connectors_dir=connectors_dir)
+                if exe is not None:
+                    token = str(exe)
+            words.append(_host_quote(token, posix=posix))
+        words.extend(redirects)
+        rendered.append(f"{separator} {' '.join(words)}".strip() if separator else " ".join(words))
+    if not any(
+        is_connector_cli_name(token, connectors_dir=connectors_dir)
+        for _separator, segment in parts
+        for token in shlex.split(segment, posix=True)
+    ):
+        return None
+    return " ".join(rendered)
+
+
 _SHELL_METACHARS = {"|", "||", "&&", ";", ">", ">>", "<", "2>", "2>>", "1>", "&"}
 
 

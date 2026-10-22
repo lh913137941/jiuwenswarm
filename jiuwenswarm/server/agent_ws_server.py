@@ -73,6 +73,9 @@ from jiuwenswarm.common.ws_diagnostics import (
 from jiuwenswarm.common.ws_limits import AGENT_WS_MAX_MESSAGE_BYTES
 from jiuwenswarm.extensions.hook_event import AgentServerHookEvents
 from jiuwenswarm.agents.harness.common.plugins.rail_manager import get_rail_manager
+from jiuwenswarm.agents.harness.common.plugins.rail_source_policy import (
+    assert_local_extension_peer,
+)
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
     is_interrupt_resume_payload,
 )
@@ -9002,15 +9005,12 @@ class AgentWebSocketServer:
     async def _handle_extensions_import(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """导入新的 Rail 扩展（文件夹结构）."""
         try:
+            assert_local_extension_peer(ws)
             params = request.params or {}
             folder_path = params.get("folder_path")
 
-            if not folder_path:
+            if not isinstance(folder_path, str) or not folder_path.strip():
                 raise ValueError("缺少 folder_path 参数")
-
-            source_path = Path(folder_path)
-            if not source_path.exists() or not source_path.is_dir():
-                raise ValueError(f"文件夹不存在或不是目录: {folder_path}")
 
             manager = get_rail_manager()
             extension = manager.import_extension(folder_path)
@@ -9037,6 +9037,7 @@ class AgentWebSocketServer:
     async def _handle_extensions_delete(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """删除 Rail 扩展."""
         try:
+            assert_local_extension_peer(ws)
             params = request.params or {}
             name = params.get("name")
 
@@ -9068,6 +9069,7 @@ class AgentWebSocketServer:
     async def _handle_extensions_toggle(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """切换 Rail 扩展的启用状态，并触发热更新."""
         try:
+            assert_local_extension_peer(ws)
             params = request.params or {}
             name = params.get("name")
             enabled = params.get("enabled", False)

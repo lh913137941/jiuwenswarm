@@ -335,7 +335,13 @@ def test_which_or_where_probe_stays_on_host_posix_shell(
     assert argv is not None
     assert "bash" in Path(argv[0]).name.lower()
     assert argv[1] in {"-c", "-lc"}
-    assert argv[-1] == cmd
+    script = argv[-1]
+    assert script.startswith("which ")
+    assert "2>/dev/null" in script
+    assert " || where " in script
+    assert "not found" in script
+    assert ";" not in script
+    assert "$(" not in script
     if os.name == "nt":
         assert argv[1] == "-c"
         assert "powershell" not in Path(argv[0]).name.lower()
@@ -348,3 +354,29 @@ def test_which_or_where_probe_stays_on_host_posix_shell(
     assert command_uses_connector_cli(
         "lark-cli calendar +today | jq .", connectors_dir=tmp_path
     )
+
+
+def test_compound_connector_command_rejects_unlisted_payloads(tmp_path: Path) -> None:
+    feishu = tmp_path / "feishu"
+    feishu.mkdir()
+    exe = feishu / "lark-cli.exe"
+    exe.write_bytes(b"fake")
+    allowed = host_shell_argv(
+        "lark-cli --version && lark-cli --help",
+        shell_type="bash",
+        connectors_dir=tmp_path,
+    )
+    assert allowed is not None
+    assert str(exe) in allowed[-1]
+    for command in (
+        "lark-cli --version && calc",
+        "lark-cli --version; id",
+        "lark-cli $(id)",
+        "lark-cli `id`",
+        "lark-cli >/tmp/pwned",
+        "command id lark-cli",
+        "echo hi | lark-cli --help && python -c import os",
+        "LD_PRELOAD=/tmp/x.so lark-cli --version",
+    ):
+        assert host_shell_argv(command, shell_type="bash", connectors_dir=tmp_path) is None, command
+

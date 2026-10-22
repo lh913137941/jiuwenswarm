@@ -3,7 +3,9 @@
 Profiling 数据工具集：从 base.h 读取宏配置、核类型映射、profiling tensor 拆分保存。
 """
 
+import ast
 import logging
+import operator
 import os
 import re
 from typing import Callable, List, Optional
@@ -22,6 +24,62 @@ def _ensure_logging() -> None:
         logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 
+_MACRO_BINOPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitOr: operator.or_,
+    ast.BitAnd: operator.and_,
+    ast.BitXor: operator.xor,
+}
+_MACRO_UNARY = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+    ast.Not: operator.not_,
+    ast.Invert: operator.invert,
+}
+_MACRO_NAMES = {"True": True, "true": True, "False": False, "false": False}
+_MAX_MACRO_SHIFT = 63
+
+
+def _eval_macro_node(node: ast.AST):
+    """Evaluate one literal or arithmetic node. Reject every other form."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float, bool)):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in _MACRO_NAMES:
+        return _MACRO_NAMES[node.id]
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _MACRO_UNARY:
+        return _MACRO_UNARY[type(node.op)](_eval_macro_node(node.operand))
+    if isinstance(node, ast.BinOp) and type(node.op) in _MACRO_BINOPS:
+        right = _eval_macro_node(node.right)
+        if isinstance(node.op, (ast.LShift, ast.RShift)):
+            if isinstance(right, bool) or not isinstance(right, int) or not 0 <= right <= _MAX_MACRO_SHIFT:
+                raise ValueError("macro shift is out of range")
+        return _MACRO_BINOPS[type(node.op)](_eval_macro_node(node.left), right)
+    if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+        values = [_eval_macro_node(item) for item in node.values]
+        combine = (
+            (lambda left, right: left and right)
+            if isinstance(node.op, ast.And)
+            else (lambda left, right: left or right)
+        )
+        result = values[0]
+        for item in values[1:]:
+            result = combine(result, item)
+        return result
+    raise ValueError("macro expression is not a literal or arithmetic value")
+
+
+def _eval_macro_expr(expr: str):
+    tree = ast.parse(expr, mode="eval")
+    return _eval_macro_node(tree.body)
+
+
 def get_define_value_from_file(filepath: str, macro_name: str):
     path = os.path.normpath(os.path.expanduser(filepath))
     if not os.path.isfile(path):
@@ -38,8 +96,7 @@ def get_define_value_from_file(filepath: str, macro_name: str):
                     continue
                 m = pattern.match(line)
                 if m:
-                    expr = m.group(1).strip().strip("()")
-                    return eval(expr, {"__builtins__": {}, "True": True, "False": False})
+                    return _eval_macro_expr(m.group(1).strip())
     except Exception as exc:
         logger.debug("could not parse macro from %s: %s", path, exc)
     return None

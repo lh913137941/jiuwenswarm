@@ -14,7 +14,7 @@ from jiuwenswarm.common.connectors import (
     command_uses_connector_cli,
     connector_bin_dirs,
     connector_host_argv,
-    expand_connector_cli_tokens,
+    render_connector_host_invocation,
 )
 
 _POSIX_WRAP_RE = re.compile(
@@ -159,10 +159,16 @@ def host_shell_argv(
         return connector
     if command_uses_connector_cli(stripped, connectors_dir=connectors_dir):
         posix = connector_wrap_posix(stripped, shell_type)
-        if posix:
-            return host_shell_wrap(stripped, posix=True)
-        expanded = expand_connector_cli_tokens(stripped, connectors_dir=connectors_dir)
-        return host_shell_wrap(expanded, posix=False)
+        rendered = render_connector_host_invocation(
+            stripped,
+            posix=posix,
+            connectors_dir=connectors_dir,
+        )
+        if rendered is None:
+            return None
+        if isinstance(rendered, list):
+            return rendered
+        return host_shell_wrap(rendered, posix=posix)
     kind = str(shell_type or "").strip().lower()
     if kind == "powershell":
         return [powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", stripped]

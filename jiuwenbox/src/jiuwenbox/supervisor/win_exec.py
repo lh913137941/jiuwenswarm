@@ -123,6 +123,42 @@ def _local_log(level: str, msg: str, exc: str | None = None) -> None:
         pass
 
 
+_soft_trace_offset = 0
+_soft_trace_lock = _threading.Lock()
+
+
+def _drain_soft_trace() -> None:
+    """把 DLL 写在沙箱跟踪文件里的行转发到 full.log.
+
+    订阅还没接上时不消费, 避免启动早期的钩子日志被读掉却送不出去.
+    """
+    global _soft_trace_offset
+    path = os.environ.get("JIUWENBOX_SOFT_DELETE_TRACE")
+    if not path or not os.path.isfile(path) or not _log_subscribers:
+        return
+    try:
+        with _soft_trace_lock:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(_soft_trace_offset)
+                chunk = handle.read()
+                if not chunk:
+                    return
+                _soft_trace_offset = handle.tell()
+        for line in chunk.splitlines():
+            text = line.strip()
+            if text:
+                _push_log("INFO", f"softdelete-trace: {text}")
+    except OSError:
+        return
+
+
+def _soft_trace_loop() -> None:
+    import time as _time
+    while True:
+        _drain_soft_trace()
+        _time.sleep(0.3)
+
+
 def _push_log(level: str, msg: str, exc: str | None = None) -> None:
     """往所有日志订阅连接 push 一个 log 帧 (best-effort, 不抛). 同时落盘+本地 logger."""
     import json as _json  # noqa: A004
@@ -718,14 +754,23 @@ def two_hop_spawn_and_authorize(
         from jiuwenbox.supervisor import win_softdelete
         if win_softdelete.enabled_from_environ():
             try:
-                win_softdelete.prepare_dll_for_sandbox_user()
+                dll = win_softdelete.prepare_dll_for_sandbox_user()
                 win_softdelete.inject_suspended(int(proc_handle))
+                logger.info(
+                    "软删除导入表注入完成 sandbox=%s pid=%s dll=%s",
+                    sandbox_id, runner_pid, dll,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "软删除 DLL 注入失败, runner 仍按原方式启动 (sandbox=%s, pid=%s): %s",
                     sandbox_id, runner_pid, exc,
                     exc_info=True,
                 )
+        else:
+            logger.info(
+                "软删除注入跳过 sandbox=%s pid=%s: JIUWENBOX_SOFT_DELETE=%s",
+                sandbox_id, runner_pid, os.environ.get("JIUWENBOX_SOFT_DELETE", "(missing)"),
+            )
         # 2. resume runner 主线程 (CREATE_SUSPENDED 必须被唤醒).
         try:
             win_job.resume_process(thread_handle)
@@ -969,6 +1014,17 @@ def _create_process_as_user(  # pylint: disable=huawei-too-many-arguments
     # DLL 靠这三个变量知道归档目录; 缺了就会把文件挪到错误的位置或拒绝删除.
     from jiuwenbox.supervisor.win_softdelete import merge_soft_delete_env
     merge_soft_delete_env(env)
+    _cmd_show = command[0] if command else ""
+    _push_log(
+        "INFO",
+        "posix-debug: child env after merge "
+        f"cmd0={_cmd_show} "
+        f"soft_delete={env.get('JIUWENBOX_SOFT_DELETE', '(missing)')} "
+        f"recycle_port={env.get('JIUWENBOX_SOFT_DELETE_RECYCLE_PORT', '(missing)')} "
+        f"token={'set' if env.get('JIUWENBOX_SOFT_DELETE_RECYCLE_TOKEN') else '(missing)'} "
+        f"dll={'set' if env.get('JIUWENBOX_SOFT_DELETE_DLL') else '(missing)'} "
+        f"trace={'set' if env.get('JIUWENBOX_SOFT_DELETE_TRACE') else '(missing)'}",
+    )
     # 沙箱可写临时区 + profile 变量补全: child env 来自 header 不带 profile 变量,
     # 用 runner token 拿 jbx-sandbox profile 目录, TEMP 指向每沙箱隔离子目录
     # (<profile>\AppData\Local\Temp\jiuwenbox\<sandbox_id>\). ms-playwright 安装目录跨沙箱共用不重下.
@@ -1379,6 +1435,25 @@ def runner_main(argv: list[str]) -> int:
     _push_log("INFO", f"runner 启动: sandbox_id={args.sandbox_id} "
                f"workspace={args.workspace} control_port={args.control_port}"
                f" local_log={_local_log_path}")
+    _push_log(
+        "INFO",
+        "posix-debug: runner env soft_delete="
+        f"{os.environ.get('JIUWENBOX_SOFT_DELETE', '(missing)')} "
+        f"recycle_port={os.environ.get('JIUWENBOX_SOFT_DELETE_RECYCLE_PORT', '(missing)')} "
+        f"dll_set={'yes' if os.environ.get('JIUWENBOX_SOFT_DELETE_DLL') else 'no'} "
+        f"trace={os.environ.get('JIUWENBOX_SOFT_DELETE_TRACE', '(missing)')}",
+    )
+    _kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    _kernel.GetModuleHandleW.restype = wintypes.HMODULE
+    _push_log(
+        "INFO",
+        "posix-debug: runner module "
+        f"pid={os.getpid()} dll_loaded={bool(_kernel.GetModuleHandleW('jiuwen_softdelete.dll'))}",
+    )
+    _threading.Thread(
+        target=_soft_trace_loop, name="softdelete-trace", daemon=True,
+    ).start()
 
     # 受限 token 当前未被 exec 消费 (exec 用 _get_runner_primary_token 起 child, 因受限 token
     # 会让 child 0xC0000142). 保留构造为未来恢复双重写检查留底: 改 _handle_exec_request 内
@@ -1830,9 +1905,10 @@ def _handle_exec_request(
         # 用受限 token 起 child 会 0xC0000142 (desktop/全局对象机制硬限制, 非 ACL/env),
         # 故 exec 用 runner 自身未受限 primary token. 代价: 失去双重写检查, 写控制只剩 ACL.
         _self_token = _get_runner_primary_token()
+        _exec_env = dict(env) if isinstance(env, dict) else {}
         try:
             pid, proc_handle, thread_handle = _create_process_as_user(
-                _self_token, list(command), env, workdir,
+                _self_token, list(command), _exec_env, workdir,
                 stdin_fd=int(child_in_read.value),
                 stdout_fd=int(child_out_write.value),
                 workspace=workspace,
@@ -1847,6 +1923,14 @@ def _handle_exec_request(
         thread_handle = 0
         if background_job is not None:
             background_job.started(pid)
+        _cmd0 = str(command[0]).lower() if command else ""
+        if "bash" in _cmd0 or (_cmd0.endswith("sh.exe") or _cmd0.endswith("sh")):
+            _push_log(
+                "INFO",
+                f"posix-debug: exec bash child pid={pid} recycle_port="
+                f"{_exec_env.get('JIUWENBOX_SOFT_DELETE_RECYCLE_PORT', '(missing)')} "
+                f"soft_delete={_exec_env.get('JIUWENBOX_SOFT_DELETE', '(missing)')}",
+            )
         _push_log("INFO",
                    f"exec child 已启动: pid={pid} cmd={command[:3] if command else []!r} "
                    f"workdir={workdir} timeout_s={header.get('timeout')}")

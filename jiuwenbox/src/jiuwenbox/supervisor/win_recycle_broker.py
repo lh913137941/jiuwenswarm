@@ -551,7 +551,10 @@ class RecycleBroker:
             logger.warning("recycle broker rejected path %s", path)
             return False
         with self._shell_lock:
-            return bool(self._recycler(real))
+            ok = bool(self._recycler(real))
+        if ok:
+            logger.info("recycle broker accepted path %s", real)
+        return ok
 
     def _serve(self) -> None:
         while not self._stopped.is_set():

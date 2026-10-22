@@ -25,6 +25,12 @@ ENV_ARCHIVE = "JIUWENBOX_SOFT_DELETE_ARCHIVE"
 ENV_DLL = "JIUWENBOX_SOFT_DELETE_DLL"
 ENV_RECYCLE_PORT = "JIUWENBOX_SOFT_DELETE_RECYCLE_PORT"
 ENV_RECYCLE_TOKEN = "JIUWENBOX_SOFT_DELETE_RECYCLE_TOKEN"
+ENV_TRACE = "JIUWENBOX_SOFT_DELETE_TRACE"
+_LOG_LAYOUT_KEYS = (
+    "JIUWENSWARM_LOG_DIR",
+    "JIUWENSWARM_LOG_DATE_ROOT",
+    "JIUWENSWARM_DATA_DIR",
+)
 _DLL_NAME = "jiuwen_softdelete.dll"
 _PATCH_ONLY = "JIUWENBOX_SOFT_DELETE_PATCH_ONLY"
 logger = logging.getLogger(__name__)
@@ -68,6 +74,18 @@ def dll_path() -> Path:
     return packaged
 
 
+def merge_host_log_layout_env(env: dict[str, str]) -> None:
+    """把 box-server 的聚合日志路径写进沙箱 runner/exec 环境.
+
+    jbx-sandbox 的 USERPROFILE 与宿主不同; 若不注入, softdelete DLL 会把
+    诊断写到沙箱 profile 下或静默失败, 宿主 full.log 看不到 bash/rm 链路.
+    """
+    for key in _LOG_LAYOUT_KEYS:
+        value = os.environ.get(key)
+        if value:
+            env.setdefault(key, value)
+
+
 def merge_soft_delete_env(env: dict[str, str]) -> None:
     """把 runner 里的软删除变量补进子进程环境.
 
@@ -75,7 +93,20 @@ def merge_soft_delete_env(env: dict[str, str]) -> None:
     的环境. 缺了归档目录或回收站转发端口, 子进程里的 DLL 就无法按
     box-server 的身份回收文件.
     """
-    for key in (ENV_ENABLED, ENV_ARCHIVE, ENV_DLL, ENV_RECYCLE_PORT, ENV_RECYCLE_TOKEN):
+    merge_soft_delete_spawn_env(env)
+
+
+def merge_soft_delete_spawn_env(env: dict[str, str]) -> None:
+    """把当前进程 (box-server 或 runner) 的软删除变量写入目标 env 块.
+
+    runner 第一跳用自定义 env 块启动, 不会自动带上父进程环境; exec 子进程
+    同样只拿 IPC 传来的 env + 本函数从 runner os.environ 补齐. 统一入口避免
+    只登记了 recycle port 却漏掉 ``JIUWENBOX_SOFT_DELETE`` / DLL 路径.
+    """
+    merge_host_log_layout_env(env)
+    for key in (
+        ENV_ENABLED, ENV_ARCHIVE, ENV_DLL, ENV_RECYCLE_PORT, ENV_RECYCLE_TOKEN, ENV_TRACE,
+    ):
         value = os.environ.get(key)
         if value:
             env.setdefault(key, value)

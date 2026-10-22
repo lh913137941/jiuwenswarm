@@ -88,8 +88,11 @@ def _build_windows_exec_env(
     (``JIUWENBOX_VENV_DIR`` / ``JIUWENBOX_BUNDLED_PYTHON``, 见 docs §4.3),
     缺失则跳过对应段。PATH 放最前, 覆盖 profile 任何残留。
     """
+    from jiuwenbox.supervisor.win_softdelete import merge_soft_delete_spawn_env
+
     base = inherited_environment()
     base.update(env or {})
+    merge_soft_delete_spawn_env(base)
     # Trusted host declarations, independent of the command request environment.
     _, parts = configured_tool_paths()
     # tool_paths 展开 (和 _create_windows 给 runner 的 PATH 一致, 确保 exec

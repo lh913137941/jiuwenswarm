@@ -16,8 +16,10 @@ from openjiuwen.core.foundation.llm.schema.message_chunk import AssistantMessage
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.session.agent import Session
 from openjiuwen.harness import create_deep_agent
+from openjiuwen.harness.rails.skills.skill_use_rail import SkillUseRail
 
 from jiuwenswarm.agents.harness.common.rails.progressive_tool_rail import ProgressiveToolRail
+from jiuwenswarm.agents.harness.flash.skill_selection import execution, service
 from jiuwenswarm.common import utils
 from jiuwenswarm.common.local_env_config import bind_task_env_overlay, reset_task_env_overlay
 from jiuwenswarm.server.runtime.agent_adapter import interface_deep, interface_flash
@@ -47,6 +49,10 @@ def skill_roots(tmp_path, monkeypatch):
     turbo = shared / "pptx-craft" / "turbo"
     codes = turbo / "turbo_codes" / "ppt"
     codes.mkdir(parents=True)
+    (shared / "pptx-craft" / "SKILL.md").write_text(
+        "---\nname: pptx-craft\ndescription: Create PPT presentations\n---\n# Workflow\nGenerate a deck.\n",
+        encoding="utf-8",
+    )
     (codes / "ppt_gen_root.py").write_text("root = None\n", encoding="utf-8")
     (turbo / "meta.json").write_text(json.dumps({
         "external_name": "pptx-craft", "description": "生成 PPT", "match_keywords": ["ppt"],
@@ -55,12 +61,17 @@ def skill_roots(tmp_path, monkeypatch):
     monkeypatch.setattr(skill_turbo_tools, "_entries_cache", {})
     monkeypatch.setattr(skill_turbo_tools, "_last_good_entries", {})
     monkeypatch.setattr(skill_turbo_tools.skill_turbo.card, "description", "")
-    return empty, shared
+    monkeypatch.setattr(execution, "_runtime", None)
+    monkeypatch.setattr(execution, "_startup_gate", execution.StartupGate())
+    monkeypatch.setattr(service, "_services", service.OrderedDict())
+    yield empty, shared
+    if execution._runtime is not None:
+        execution._runtime.shutdown()
 
 
-def _assemble_flash(monkeypatch, *, enabled=True, disabled=None, lazy=True):
+def _assemble_flash(monkeypatch, *, enabled=True, disabled=None, lazy=True, selection=False, skill_root=None):
     adapter = object.__new__(JiuwenSwarmFlashAdapter)
-    config = adapter._apply_flash_react_override({"react": {
+    config = adapter._apply_flash_react_override({"flash": {"skill_selection": {"enabled": selection}}, "react": {
         "skill_turbo": {"enabled": enabled},
         "tool_lazy_load": {"enabled": lazy},
         "disabled_tools": disabled or [],
@@ -73,9 +84,11 @@ def _assemble_flash(monkeypatch, *, enabled=True, disabled=None, lazy=True):
     adapter._instance_overrides = {}
     adapter._stream_event_rail = adapter._checkpointer = None
     adapter._skill_turbo_prompt_rail = None
+    adapter._skill_rail = None
     real_builders = {
         "_build_agent_rails", "_build_progressive_tool_rail",
-        "_build_disabled_tools_rail",
+        "_build_disabled_tools_rail", "_build_skill_turbo_prompt_rail",
+        "_build_flash_skill_selection_rail",
     }
     for name in dir(JiuwenSwarmFlashAdapter):
         if name.startswith("_build_") and name not in real_builders:
@@ -92,9 +105,11 @@ def _assemble_flash(monkeypatch, *, enabled=True, disabled=None, lazy=True):
     # real Flash request hook and exercise its ordering before the real SDK.
     monkeypatch.setattr(interface_deep.JiuWenSwarmDeepAdapter, "_update_runtime_config", AsyncMock())
     monkeypatch.setattr(adapter, "_sync_unified_memory_tool_visibility", Mock())
+    if skill_root is not None:
+        native = SkillUseRail([str(skill_root)], skill_mode="all", include_tools=False)
+        monkeypatch.setattr(adapter, "_build_skill_rail", lambda **_: native)
     rails = adapter._build_agent_rails(config["react"], config, mode="flash")
     adapter._build_task_execution_rail.assert_not_called()
-    adapter._build_skill_turbo_prompt_rail.assert_not_called()
     adapter._build_skill_protocol_prompt_rail.assert_not_called()
     return adapter, rails
 
@@ -122,15 +137,21 @@ class _Model:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["invoke", "stream"])
 @pytest.mark.parametrize("lazy", [True, False])
+@pytest.mark.parametrize("selection", [False, True])
+@pytest.mark.parametrize("query", [
+    "生成环保碳中和汇报 PPT，全程不出现任何人像 使用 pptx-craft 技能",
+    "幻灯片 生成环保碳中和汇报 PPT，全程不出现任何人像 使用 pptx-craft 技能",
+    "生成环保碳中和汇报 PPT，全程不出现任何人像",
+])
 async def test_relay_empty_prewarm_refreshes_before_first_real_model_call(
-    monkeypatch, tmp_path, skill_roots, mode, lazy,
+    monkeypatch, tmp_path, skill_roots, mode, lazy, selection, query,
 ):
     _, shared = skill_roots
     with _skill_env():
         initial = skill_turbo_tools._build_tool_description()
         assert "当前内部支持：暂无" in initial
         skill_turbo_tools.skill_turbo.card.description = initial
-        adapter, rails = _assemble_flash(monkeypatch, lazy=lazy)
+        adapter, rails = _assemble_flash(monkeypatch, lazy=lazy, selection=selection, skill_root=shared)
 
     scans = Mock(wraps=turbo_package_loader.discover_external_turbo_skills)
     monkeypatch.setattr(turbo_package_loader, "discover_external_turbo_skills", scans)
@@ -151,13 +172,13 @@ async def test_relay_empty_prewarm_refreshes_before_first_real_model_call(
             session = Session(session_id=f"relay-flash-{uuid4().hex}", card=core.card)
             with _skill_env(shared):
                 await adapter._update_runtime_config(SimpleNamespace(mode="flash"))
-                await session.pre_run(inputs={"query": "制作销售复盘 PPT"})
+                await session.pre_run(inputs={"query": query})
                 if mode == "stream":
                     _ = [chunk async for chunk in core.stream(
-                        {"query": "制作销售复盘 PPT"}, session=session,
+                        {"query": query}, session=session,
                     )]
                 else:
-                    await core.invoke({"query": "制作销售复盘 PPT"}, session=session)
+                    await core.invoke({"query": query}, session=session)
                 await session.post_run()
         assert len(model.calls) == 2
         for messages, tools in model.calls:
@@ -166,8 +187,20 @@ async def test_relay_empty_prewarm_refreshes_before_first_real_model_call(
             assert "当前内部支持：pptx-craft" in cards[0].description
             assert "暂无" not in cards[0].description
             assert not any("当前内部支持：暂无" in str(message.content) for message in messages)
-            # Do not bring back the full Turbo guide (with legacy todo names).
-            assert not any("## 技能加速通道" in str(message.content) for message in messages)
+            # The model needs routing guidance, not just a visible tool card.
+            system_text = "\n".join(str(message.content) for message in messages if message.role == "system")
+            assert "## 技能加速通道" in system_text
+            assert "todo_modify" not in system_text
+            assert "当前支持：pptx-craft" in system_text
+            assert "第一个工具调用必须是 skill_acceleration_exec" in system_text
+            assert "这条规则不依赖技能检索开关" in system_text
+            assert "__skill_turbo_hitl__" in system_text
+            assert any(message.content == query for message in messages if message.role == "user")
+            tool_names = [tool.name for tool in tools]
+            assert ("search_installed_skills" in tool_names) is selection
+        selection_rail = adapter._flash_skill_selection_rail
+        assert selection_rail._last_error is None
+        assert (selection_rail.service is not None) is selection
         # The second request reuses the existing roots-keyed TTL cache.
         assert scans.call_count == 1
     finally:
@@ -234,3 +267,36 @@ async def test_refresh_updates_a_copied_card_and_skips_missing_or_disabled_tool(
     adapter._instance.ability_manager.get = lambda _: None
     await adapter._update_runtime_config(SimpleNamespace(mode="flash"))
     refresh.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_turbo_guide_follows_request_roots_and_actual_tool_visibility(monkeypatch, tmp_path, skill_roots):
+    empty, shared = skill_roots
+    adapter, rails = _assemble_flash(monkeypatch)
+    monkeypatch.setattr("openjiuwen.harness.deep_agent.schedule_image_support_probe", lambda *_: None)
+    model = _Model()
+    await Runner.start()
+    core = create_deep_agent(
+        model=model, tools=[], rails=rails, system_prompt="Test",
+        enable_task_loop=False, max_iterations=2, workspace=str(tmp_path / "workspace"),
+    )
+    adapter._instance = core
+    try:
+        await core._ensure_initialized()
+        adapter._init_skill_turbo_tool()
+        for root, present, expected in [(empty, True, False), (shared, True, True),
+                                        (empty, True, False), (shared, True, True),
+                                        (shared, False, False)]:
+            if not present:
+                core.ability_manager.remove(TURBO_TOOL_NAME)
+            with _skill_env(root):
+                await adapter._update_runtime_config(SimpleNamespace(mode="flash"))
+                session = Session(session_id=f"flash-roots-{uuid4().hex}", card=core.card)
+                await session.pre_run(inputs={"query": "使用 pptx-craft 生成 PPT"})
+                await core.invoke({"query": "使用 pptx-craft 生成 PPT"}, session=session)
+                await session.post_run()
+            messages, _ = model.calls[-1]
+            text = "\n".join(str(m.content) for m in messages if m.role == "system")
+            assert ("## 技能加速通道" in text) is expected
+    finally:
+        await core.stop()

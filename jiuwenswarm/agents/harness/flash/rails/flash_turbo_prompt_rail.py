@@ -8,13 +8,12 @@ from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.harness.prompts import PromptSection
 
 from jiuwenswarm.agents.harness.common.prompt.prompt_builder import PromptPriority
-
-from jiuwenswarm.server.runtime.skill_turbo.rails.skill_prompt_rail import (
-    SkillTurboPromptRail,
-    _SECTION_NAME,
-    _SKILL_ACCELERATION_TOOL,
-)
+from jiuwenswarm.server.runtime.skill_turbo.rails.skill_prompt_rail import SkillTurboPromptRail
 from jiuwenswarm.server.runtime.skill_turbo.region_edit import region_edit_keyword_summary
+
+# Stable section/tool identifiers; do not import private implementation constants.
+_SECTION_NAME = "skill_turbo_guide"
+_SKILL_ACCELERATION_TOOL = "skill_acceleration_exec"
 
 
 class FlashTurboPromptRail(SkillTurboPromptRail):

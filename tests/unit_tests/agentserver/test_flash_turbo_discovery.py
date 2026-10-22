@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from openjiuwen.core.foundation.llm.schema.message_chunk import AssistantMessage
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.session.agent import Session
 from openjiuwen.harness import create_deep_agent
+from openjiuwen.harness.prompts import PromptSection, SystemPromptBuilder
 from openjiuwen.harness.rails.skills.skill_use_rail import SkillUseRail
 
 from jiuwenswarm.agents.harness.common.rails.progressive_tool_rail import ProgressiveToolRail
@@ -27,6 +29,11 @@ from jiuwenswarm.server.runtime.agent_adapter.interface_flash import JiuwenSwarm
 from jiuwenswarm.server.runtime.skill_turbo import skill_turbo_tools, turbo_package_loader
 
 TURBO_TOOL_NAME = "skill_acceleration_exec"
+PPT_QUERIES = (
+    "生成环保碳中和汇报 PPT，全程不出现任何人像 使用 pptx-craft 技能",
+    "幻灯片 生成环保碳中和汇报 PPT，全程不出现任何人像 使用 pptx-craft 技能",
+    "生成环保碳中和汇报 PPT，全程不出现任何人像",
+)
 
 
 @contextmanager
@@ -138,13 +145,8 @@ class _Model:
 @pytest.mark.parametrize("mode", ["invoke", "stream"])
 @pytest.mark.parametrize("lazy", [True, False])
 @pytest.mark.parametrize("selection", [False, True])
-@pytest.mark.parametrize("query", [
-    "生成环保碳中和汇报 PPT，全程不出现任何人像 使用 pptx-craft 技能",
-    "幻灯片 生成环保碳中和汇报 PPT，全程不出现任何人像 使用 pptx-craft 技能",
-    "生成环保碳中和汇报 PPT，全程不出现任何人像",
-])
 async def test_relay_empty_prewarm_refreshes_before_first_real_model_call(
-    monkeypatch, tmp_path, skill_roots, mode, lazy, selection, query,
+    monkeypatch, tmp_path, skill_roots, mode, lazy, selection,
 ):
     _, shared = skill_roots
     with _skill_env():
@@ -168,7 +170,8 @@ async def test_relay_empty_prewarm_refreshes_before_first_real_model_call(
         # Real adapter registration follows the Turbo switch and shared tool registry.
         adapter._init_skill_turbo_tool()
         assert core.ability_manager.get(TURBO_TOOL_NAME) is not None
-        for _ in range(2):
+        # Reuse the assembled SDK for all entry texts; config combinations remain independent.
+        for query in PPT_QUERIES:
             session = Session(session_id=f"relay-flash-{uuid4().hex}", card=core.card)
             with _skill_env(shared):
                 await adapter._update_runtime_config(SimpleNamespace(mode="flash"))
@@ -180,8 +183,8 @@ async def test_relay_empty_prewarm_refreshes_before_first_real_model_call(
                 else:
                     await core.invoke({"query": query}, session=session)
                 await session.post_run()
-        assert len(model.calls) == 2
-        for messages, tools in model.calls:
+        assert len(model.calls) == len(PPT_QUERIES)
+        for query, (messages, tools) in zip(PPT_QUERIES, model.calls, strict=True):
             cards = [tool for tool in tools if tool.name == TURBO_TOOL_NAME]
             assert len(cards) == 1
             assert "当前内部支持：pptx-craft" in cards[0].description
@@ -201,7 +204,7 @@ async def test_relay_empty_prewarm_refreshes_before_first_real_model_call(
         selection_rail = adapter._flash_skill_selection_rail
         assert selection_rail._last_error is None
         assert (selection_rail.service is not None) is selection
-        # The second request reuses the existing roots-keyed TTL cache.
+        # Subsequent entry texts reuse the existing roots-keyed TTL cache.
         assert scans.call_count == 1
     finally:
         await core.stop()
@@ -215,7 +218,11 @@ async def test_disabled_turbo_is_not_refreshed_or_exposed(
     monkeypatch, tmp_path, skill_roots, enabled, disabled,
 ):
     adapter, rails = _assemble_flash(monkeypatch, enabled=enabled, disabled=disabled)
-    assert adapter._skill_turbo_prompt_rail is None
+    if enabled:
+        assert adapter._skill_turbo_prompt_rail in rails
+        assert adapter._skill_turbo_prompt_rail._acceleration_disabled is True
+    else:
+        assert adapter._skill_turbo_prompt_rail is None
     progressive = next(rail for rail in rails if isinstance(rail, ProgressiveToolRail))
     assert TURBO_TOOL_NAME not in progressive.eager_tools
     refresh = Mock(wraps=skill_turbo_tools.refresh_skill_acceleration_description)
@@ -233,6 +240,11 @@ async def test_disabled_turbo_is_not_refreshed_or_exposed(
         adapter._init_skill_turbo_tool()
         if not enabled:
             assert core.ability_manager.get(TURBO_TOOL_NAME) is None
+        else:
+            # A disabled rail must clear a guide left in the prompt builder.
+            core.system_prompt_builder.add_section(PromptSection(
+                name="skill_turbo_guide", content={"cn": "stale turbo guide"}, priority=8,
+            ))
         with _skill_env(skill_roots[1]):
             await adapter._update_runtime_config(SimpleNamespace(mode="flash"))
             session = Session(session_id=f"flash-off-{uuid4().hex}", card=core.card)
@@ -244,6 +256,7 @@ async def test_disabled_turbo_is_not_refreshed_or_exposed(
         for messages, tools in model.calls:
             assert TURBO_TOOL_NAME not in [tool.name for tool in tools]
             assert not any(TURBO_TOOL_NAME in str(message.content) for message in messages)
+            assert not any("stale turbo guide" in str(message.content) for message in messages)
     finally:
         await core.stop()
 
@@ -300,3 +313,82 @@ async def test_turbo_guide_follows_request_roots_and_actual_tool_visibility(monk
             assert ("## 技能加速通道" in text) is expected
     finally:
         await core.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_kind", ["import", "constructor"])
+async def test_turbo_prompt_build_failure_keeps_flash_usable(
+    monkeypatch, tmp_path, skill_roots, failure_kind,
+):
+    module_name = "jiuwenswarm.agents.harness.flash.rails.flash_turbo_prompt_rail"
+    error = ImportError("Turbo prompt dependency unavailable") if failure_kind == "import" else RuntimeError(
+        "Turbo prompt constructor failed",
+    )
+    warning = Mock(wraps=interface_flash.logger.warning)
+    with monkeypatch.context() as faults:
+        faults.setattr(interface_flash.logger, "warning", warning)
+        if failure_kind == "import":
+            original_import = builtins.__import__
+
+            def failing_import(name, *args, **kwargs):
+                if name == module_name:
+                    raise error
+                return original_import(name, *args, **kwargs)
+
+            faults.setattr(builtins, "__import__", failing_import)
+        else:
+            from jiuwenswarm.agents.harness.flash.rails import flash_turbo_prompt_rail
+
+            faults.setattr(flash_turbo_prompt_rail, "FlashTurboPromptRail", Mock(
+                side_effect=error,
+            ))
+        adapter, rails = _assemble_flash(monkeypatch, skill_root=skill_roots[1])
+    assert adapter._skill_turbo_prompt_rail is None
+    warning.assert_any_call("[FlashAdapter] FlashTurboPromptRail create failed: %s", error, exc_info=True)
+    assert any(isinstance(rail, ProgressiveToolRail) for rail in rails)
+    monkeypatch.setattr("openjiuwen.harness.deep_agent.schedule_image_support_probe", lambda *_: None)
+    model = _Model()
+    await Runner.start()
+    core = create_deep_agent(
+        model=model, tools=[], rails=rails, system_prompt="Test",
+        enable_task_loop=False, max_iterations=2, workspace=str(tmp_path / "workspace"),
+    )
+    adapter._instance = core
+    try:
+        await core._ensure_initialized()
+        adapter._init_skill_turbo_tool()
+        with _skill_env(skill_roots[1]):
+            await adapter._update_runtime_config(SimpleNamespace(mode="flash"))
+            session = Session(session_id=f"flash-guide-failure-{uuid4().hex}", card=core.card)
+            await session.pre_run(inputs={"query": "你好"})
+            await core.invoke({"query": "你好"}, session=session)
+            await session.post_run()
+        assert len(model.calls) == 1
+        messages, tools = model.calls[0]
+        assert any(tool.name == TURBO_TOOL_NAME for tool in tools)
+        assert not any("## 技能加速通道" in str(message.content) for message in messages)
+    finally:
+        await core.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language,title", [("cn", "## 技能加速通道"), ("en", "## Skill Acceleration Channel")])
+async def test_flash_guide_preserves_priority_and_cleans_up(monkeypatch, skill_roots, language, title):
+    adapter, _ = _assemble_flash(monkeypatch)
+    rail = adapter._skill_turbo_prompt_rail
+    builder = SystemPromptBuilder(language=language)
+    builder.add_section(PromptSection(
+        name="skill_turbo_guide", content={language: "stale"}, priority=321,
+    ))
+    agent = SimpleNamespace(system_prompt_builder=builder)
+    rail.init(agent)
+    with _skill_env(skill_roots[1]):
+        await rail.before_model_call(SimpleNamespace(
+            agent=agent, inputs=SimpleNamespace(tools=[skill_turbo_tools.skill_turbo.card]),
+        ))
+    section = builder.get_section("skill_turbo_guide")
+    assert section.priority == 321
+    assert title in section.content[language]
+    rail.uninit(agent)
+    assert builder.get_section("skill_turbo_guide") is None
+    assert rail.system_prompt_builder is None

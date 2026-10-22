@@ -752,7 +752,15 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
     def _build_identity_rail(self) -> IdentityRail | None:
         """Build IdentityRail to load IDENTITY.md into the identity section."""
         try:
-            rail = IdentityRail(language=self._resolve_runtime_language())
+            default_identity = next(
+                (section for section in self._build_static_system_prompt_sections()
+                 if section.name == "identity"),
+                None,
+            )
+            rail = IdentityRail(
+                language=self._resolve_runtime_language(),
+                default_identity_section=default_identity,
+            )
             logger.info("[JiuwenSwarmCodeAdapter] IdentityRail create success")
         except Exception as exc:
             logger.warning("[JiuwenSwarmCodeAdapter] IdentityRail create failed: %s", exc)

@@ -2369,16 +2369,16 @@
     "importTitle": "Import Extension",
     "importButton": "Import",
     "importing": "Importing...",
-    "folderPathPlaceholder": "Enter extension folder path (e.g., D:/extensions/my_extension)",
-    "importHint": "Folder requirements: 1) English name 2) Contains rail.py entry file",
+    "folderPathPlaceholder": "A direct child of the trusted import directory, e.g. .../workspace/rail_imports/my_extension",
+    "importHint": "Only a direct child of a trusted directory can be imported. Use an English folder name and include rail.py. The default directory is rail_imports under the agent workspace.",
     "importFailed": "Failed to import extension",
     "noExtensions": "No extensions",
     "confirmDelete": "Are you sure you want to delete extension \"{{name}}\"?",
     "deleteButton": "Delete",
     "toggleFailed": "Failed to toggle extension status",
     "helpTitle": "Usage Guide",
-    "help0": "Extension folder must contain rail.py as the entry file",
-    "help1": "Rail extension files must inherit from DeepAgentRail or AgentRail base class",
+    "help0": "Place the extension folder in the trusted import directory (default: ~/.jiuwenswarm/agent/workspace/rail_imports), then enter that path",
+    "help1": "rail.py must define a DeepAgentRail or AgentRail subclass and cannot use dynamic execution or process calls",
     "help2": "Extension files are saved to ~/.jiuwenswarm/agent/workspace/extensions/ directory",
     "errors": {
       "missingFolderPath": "Missing folder_path parameter",
@@ -2386,7 +2386,8 @@
       "invalidFolderName": "Folder name \"{{name}}\" must be a valid English identifier",
       "alreadyExists": "Extension \"{{name}}\" already exists",
       "missingRailFile": "Extension folder must contain a rail.py file",
-      "railValidationFailed": "rail.py validation failed"
+      "railValidationFailed": "rail.py validation failed",
+      "untrustedFolder": "Extension folder must be inside a trusted import directory: {{roots}}"
     }
   },
   "ownerScopes": {

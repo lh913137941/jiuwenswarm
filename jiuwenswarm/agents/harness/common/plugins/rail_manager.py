@@ -8,15 +8,37 @@ import importlib
 import importlib.util
 import json
 import logging
-import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List
 
+from jiuwenswarm.agents.harness.common.plugins.rail_source_policy import (
+    ScannedRailFinder,
+    ScannedRailLoader,
+    contained_extension_dir,
+    import_roots,
+    read_extension_sources,
+    remove_contained_tree,
+    resolve_import_source,
+    safe_extension_name,
+    validate_extension_sources,
+)
 from jiuwenswarm.common.utils import get_agent_workspace_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _is_rail_subclass(rail_class: Any) -> bool:
+    """Return whether the executed object is a user Rail, not the base itself."""
+    if not isinstance(rail_class, type):
+        return False
+    from openjiuwen.core.single_agent.rail.base import AgentRail
+    from openjiuwen.harness.rails import DeepAgentRail
+
+    if rail_class in (DeepAgentRail, AgentRail):
+        return False
+    return issubclass(rail_class, (DeepAgentRail, AgentRail))
 
 
 @dataclass
@@ -40,10 +62,13 @@ class RailExtension:
 
     @classmethod
     def from_dict(cls, data: dict) -> RailExtension:
+        enabled = data.get("enabled", True)
+        if not isinstance(enabled, bool):
+            enabled = False
         return cls(
             name=data["name"],
             class_name=data.get("class_name", "CustomRail"),
-            enabled=data.get("enabled", True),
+            enabled=enabled,
             description=data.get("description", ""),
             priority=data.get("priority", 50),
         )
@@ -82,6 +107,7 @@ class RailManager:
         self._agent_instance: Any = None
         # 缓存已加载的 rail 实例，确保同一个 rail 只实例化一次
         self._rail_instances: dict[str, Any] = {}
+        self._rail_finders: dict[str, ScannedRailFinder] = {}
 
         self._initialized = True
         logger.info("[RailManager] 初始化完成，扩展目录: %s", self._extensions_dir)
@@ -92,10 +118,23 @@ class RailManager:
             try:
                 with open(self._config_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self._extensions = {
-                        name: RailExtension.from_dict(ext_data)
-                        for name, ext_data in data.items()
-                    }
+                    if not isinstance(data, dict):
+                        raise ValueError("extensions config must be an object")
+                    loaded: dict[str, RailExtension] = {}
+                    for name, ext_data in data.items():
+                        if (
+                            not isinstance(ext_data, dict)
+                            or ext_data.get("name") != name
+                        ):
+                            logger.warning("[RailManager] 跳过无效扩展配置: %s", name)
+                            continue
+                        try:
+                            safe_extension_name(name)
+                        except ValueError:
+                            logger.warning("[RailManager] 跳过非法扩展名: %s", name)
+                            continue
+                        loaded[name] = RailExtension.from_dict(ext_data)
+                    self._extensions = loaded
                 logger.info("[RailManager] 加载了 %d 个扩展配置", len(self._extensions))
             except Exception as e:
                 logger.error("[RailManager] 加载配置文件失败: %s", e)
@@ -106,10 +145,7 @@ class RailManager:
     def _save_config(self) -> None:
         """保存扩展信息到配置文件."""
         try:
-            data = {
-                name: ext.to_dict()
-                for name, ext in self._extensions.items()
-            }
+            data = {name: ext.to_dict() for name, ext in self._extensions.items()}
             with open(self._config_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             logger.debug("[RailManager] 保存配置文件成功")
@@ -134,48 +170,42 @@ class RailManager:
             ValueError: 文件夹名称无效或结构不符合要求
             Exception: 其他错误
         """
-        source_path = Path(folder_path)
-        if not source_path.exists() or not source_path.is_dir():
-            raise ValueError(f"文件夹不存在或不是目录: {folder_path}")
-
-        # 获取文件夹名称
-        name = source_path.name
-
-        # 验证文件夹名称是否为有效的英文标识符
-        if not name.isidentifier() or not name.isascii():
-            raise ValueError(f"文件夹名称 '{name}' 必须是有效的英文标识符")
+        roots = import_roots(self._extensions_dir)
+        source_path = resolve_import_source(folder_path, roots)
+        name = safe_extension_name(source_path.name)
 
         # 检查是否已存在
         if name in self._extensions:
             raise ValueError(f"扩展 '{name}' 已存在")
 
-        # 验证文件夹结构：必须包含 rail.py
-        plugin_file = source_path / "rail.py"
-        if not plugin_file.exists():
-            raise ValueError(f"扩展文件夹必须包含 rail.py 文件")
-
-        # 读取并验证 rail.py 内容
+        sources = read_extension_sources(source_path)
         try:
-            with open(plugin_file, "r", encoding="utf-8") as f:
-                plugin_content = f.read()
-            self._validate_rail_file(plugin_content, name)
-        except Exception as e:
-            logger.error("[RailManager] rail.py 验证失败: %s", e)
-            raise ValueError("rail.py 验证失败") from e
+            class_name = validate_extension_sources(sources)
+        except ValueError as exc:
+            logger.error("[RailManager] rail.py 验证失败: %s", exc)
+            raise
 
-        # 复制整个文件夹到扩展目录
-        dest_path = self._extensions_dir / name
+        plugin_content = sources["rail.py"]
+        dest_path = contained_extension_dir(self._extensions_dir, name)
         try:
-            if dest_path.exists():
-                shutil.rmtree(dest_path)
-            shutil.copytree(source_path, dest_path)
-            logger.info("[RailManager] 复制文件夹成功: %s -> %s", source_path, dest_path)
+            if dest_path.exists() or dest_path.is_symlink():
+                remove_contained_tree(dest_path, self._extensions_dir)
+            dest_path.mkdir(parents=True, exist_ok=False)
+            for filename, text in sources.items():
+                target = dest_path / filename
+                if target.parent != dest_path:
+                    raise ValueError("扩展路径越界")
+                target.write_text(text, encoding="utf-8", newline="\n")
+            logger.info(
+                "[RailManager] 复制文件夹成功: %s -> %s", source_path, dest_path
+            )
         except Exception as e:
             logger.error("[RailManager] 复制文件夹失败: %s", e)
+            if dest_path.exists() or dest_path.is_symlink():
+                remove_contained_tree(dest_path, self._extensions_dir)
             raise
 
         # 创建扩展记录
-        class_name = self._extract_class_name(plugin_content, name)
         description = self._extract_description(plugin_content)
         priority = self._extract_priority(plugin_content)
 
@@ -192,53 +222,6 @@ class RailManager:
 
         logger.info("[RailManager] 导入扩展成功: %s", name)
         return extension.to_dict()
-
-    @staticmethod
-    def _validate_rail_file(file_str: str, name: str) -> None:
-        """验证 Rail 文件内容是否有效.
-
-        Args:
-            file_str: 文件内容字符串
-            name: 扩展名称
-
-        Raises:
-            ValueError: 文件内容无效
-        """
-        # 简单验证：文件中必须包含继承自 DeepAgentRail 或 AgentRail 的类
-        required_patterns = ["DeepAgentRail", "AgentRail"]
-        has_required_import = any(pattern in file_str for pattern in required_patterns)
-
-        if not has_required_import:
-            raise ValueError("文件必须包含对 DeepAgentRail 或 AgentRail 的导入")
-
-        # 验证语法
-        try:
-            compile(file_str, f"{name}.py", "exec")
-        except SyntaxError as e:
-            logger.error("[RailManager] rail.py 验证失败: %s", e)
-            raise ValueError("语法错误") from e
-
-    @staticmethod
-    def _extract_class_name(file_str: str, default_name: str) -> str:
-        """从文件内容中提取 Rail 类名.
-
-        Args:
-            file_str: 文件内容字符串
-            default_name: 默认类名 (使用扩展名的首字母大写形式)
-
-        Returns:
-            提取到的类名
-        """
-        # 尝试匹配 "class XXXRail(DeepAgentRail):" 或 "class XXXRail(AgentRail):"
-        import re
-
-        pattern = r"class\s+(\w+Rail)\s*\(\s*(DeepAgentRail|AgentRail)\s*\)"
-        matches = re.findall(pattern, file_str)
-        if matches:
-            return matches[0][0]
-
-        # 默认使用扩展名 + "Rail"
-        return default_name.capitalize() + "Rail"
 
     @staticmethod
     def _extract_description(file_str: str) -> str:
@@ -273,7 +256,7 @@ class RailManager:
         import re
 
         # 尝试匹配 priority: int = XX
-        pattern = r'priority\s*:\s*int\s*=\s*(\d+)'
+        pattern = r"priority\s*:\s*int\s*=\s*(\d+)"
         match = re.search(pattern, file_str)
         if match:
             return int(match.group(1))
@@ -300,6 +283,7 @@ class RailManager:
         Raises:
             ValueError: 扩展不存在
         """
+        safe_extension_name(name)
         if name not in self._extensions:
             raise ValueError(f"扩展 '{name}' 不存在")
 
@@ -312,18 +296,15 @@ class RailManager:
         if name in self._rail_instances:
             del self._rail_instances[name]
             logger.info("[RailManager] 扩展 '%s' 的缓存实例已清除", name)
+        self._drop_loaded(name)
 
-        # 删除整个文件夹
-        folder_path = self._extensions_dir / name
-        if folder_path.exists():
-            try:
-                if folder_path.is_dir():
-                    shutil.rmtree(folder_path)
-                else:
-                    folder_path.unlink()
-            except Exception as e:
-                logger.error("[RailManager] 删除文件夹失败: %s", e)
-                raise
+        # 删除整个文件夹。只删除扩展目录内的这个名称，不跟随指向外部的链接。
+        folder_path = contained_extension_dir(self._extensions_dir, name)
+        try:
+            remove_contained_tree(folder_path, self._extensions_dir)
+        except Exception as e:
+            logger.error("[RailManager] 删除文件夹失败: %s", e)
+            raise
 
         # 删除扩展记录
         del self._extensions[name]
@@ -345,6 +326,9 @@ class RailManager:
         Raises:
             ValueError: 扩展不存在
         """
+        safe_extension_name(name)
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
         if name not in self._extensions:
             raise ValueError(f"扩展 '{name}' 不存在")
 
@@ -369,6 +353,9 @@ class RailManager:
         Raises:
             ValueError: 扩展不存在或未设置 agent 实例
         """
+        safe_extension_name(name)
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled 必须是布尔值")
         if name not in self._extensions:
             raise ValueError(f"扩展 '{name}' 不存在")
 
@@ -453,54 +440,30 @@ class RailManager:
         return self._load_rail_instance_impl(name)
 
     def _load_rail_class(self, name: str) -> type:
-        """加载 Rail 类（不实例化，不缓存）."""
-        extension = self._extensions[name]
+        """加载 Rail 类（不实例化，不缓存）.
 
-        folder_path = self._extensions_dir / name
-        plugin_file = folder_path / "rail.py"
-        if not plugin_file.exists():
+        只执行已经通过静态检查的源码副本，并且实例化的对象必须真的是
+        DeepAgentRail 或 AgentRail 的子类。配置里的 class_name 不能把
+        加载目标改到模块里的其他对象。
+        """
+        safe_extension_name(name)
+        if name not in self._extensions:
+            raise ValueError(f"扩展 '{name}' 不存在")
+
+        folder_path = contained_extension_dir(self._extensions_dir, name)
+        if not (folder_path / "rail.py").is_file():
             raise ValueError(f"扩展插件文件 '{name}/rail.py' 不存在")
 
+        sources = read_extension_sources(folder_path)
+        class_name = validate_extension_sources(sources)
         try:
-            module: Any
-            if (folder_path / "__init__.py").exists():
-                package_name = f"jiuwenswarm_rail_extension_{name}"
-                package_spec = importlib.util.spec_from_file_location(
-                    package_name,
-                    folder_path / "__init__.py",
-                    submodule_search_locations=[str(folder_path)],
-                )
-                if package_spec is None or package_spec.loader is None:
-                    raise ValueError(f"无法加载包规范: {name}")
-
-                package_module = importlib.util.module_from_spec(package_spec)
-                sys.modules[package_name] = package_module
-                package_spec.loader.exec_module(package_module)
-
-                module_name = f"{package_name}.rail"
-                rail_spec = importlib.util.spec_from_file_location(module_name, plugin_file)
-                if rail_spec is None or rail_spec.loader is None:
-                    raise ValueError(f"无法加载 Rail 模块: {name}")
-
-                module = importlib.util.module_from_spec(rail_spec)
-                sys.modules[module_name] = module
-                rail_spec.loader.exec_module(module)
-            else:
-                spec = importlib.util.spec_from_file_location(
-                    f"rail_extension_{name}", plugin_file
-                )
-                if spec is None or spec.loader is None:
-                    raise ValueError(f"无法加载模块规范: {name}")
-
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-
-            rail_class = getattr(module, extension.class_name, None)
-            if rail_class is None:
-                raise ValueError(f"模块中未找到类: {extension.class_name}")
-
+            module = self._execute_scanned(name, folder_path, sources)
+            rail_class = getattr(module, class_name, None)
+            if not _is_rail_subclass(rail_class):
+                raise ValueError(f"模块中未找到类: {class_name}")
             return rail_class
         except ImportError as e:
+            self._drop_loaded(name)
             if "attempted relative import with no known parent package" in str(e):
                 raise ValueError(
                     f"扩展 '{name}' 使用了相对导入但缺少 __init__.py 文件。"
@@ -508,8 +471,55 @@ class RailManager:
                 ) from e
             raise
         except Exception as e:
+            self._drop_loaded(name)
             logger.error("[RailManager] 加载 Rail 类失败: %s, 错误: %s", name, e)
             raise
+
+    def _execute_scanned(self, name: str, folder: Path, sources: dict[str, str]) -> Any:
+        """Execute validated source from memory."""
+        self._drop_loaded(name)
+        if "__init__.py" in sources:
+            package = f"jiuwenswarm_rail_extension_{name}"
+            modules: dict[str, tuple[str, str, bool]] = {
+                package: (sources["__init__.py"], str(folder / "__init__.py"), True),
+            }
+            for filename, source in sources.items():
+                if filename == "__init__.py":
+                    continue
+                modules[f"{package}.{Path(filename).stem}"] = (
+                    source,
+                    str(folder / filename),
+                    False,
+                )
+            finder = ScannedRailFinder(modules)
+            sys.meta_path.insert(0, finder)
+            self._rail_finders[name] = finder
+            importlib.import_module(package)
+            return importlib.import_module(f"{package}.rail")
+
+        module_name = f"rail_extension_{name}"
+        filename = str(folder / "rail.py")
+        loader = ScannedRailLoader(sources["rail.py"], filename)
+        spec = importlib.util.spec_from_loader(module_name, loader, origin=filename)
+        if spec is None:
+            raise ValueError(f"无法加载模块规范: {name}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        loader.exec_module(module)
+        return module
+
+    def _drop_loaded(self, name: str) -> None:
+        finder = self._rail_finders.pop(name, None)
+        if finder is not None:
+            try:
+                sys.meta_path.remove(finder)
+            except ValueError:
+                pass
+        package = f"jiuwenswarm_rail_extension_{name}"
+        standalone = f"rail_extension_{name}"
+        for key in list(sys.modules):
+            if key == standalone or key == package or key.startswith(package + "."):
+                sys.modules.pop(key, None)
 
     def _load_rail_instance_impl(self, name: str) -> Any:
         """加载 rail 实例的实现（缓存机制，确保主 agent 的 rail 只实例化一次）."""
@@ -541,7 +551,9 @@ class RailManager:
 
         rail_class = self._load_rail_class(name)
         rail_instance = rail_class()
-        logger.debug("[RailManager] 创建新 Rail 实例（team 专用）: %s -> %s", name, rail_instance)
+        logger.debug(
+            "[RailManager] 创建新 Rail 实例（team 专用）: %s -> %s", name, rail_instance
+        )
         return rail_instance
 
 

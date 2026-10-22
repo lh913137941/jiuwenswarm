@@ -5417,6 +5417,22 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                 code="BAD_REQUEST",
             )
             return
+        from jiuwenswarm.gateway.channel_manager.im_platforms.whatsapp.bridge_launch import (
+            validate_whatsapp_channel_config,
+        )
+        from jiuwenswarm.gateway.channel_manager.spec import ChannelConfigError
+
+        try:
+            validate_whatsapp_channel_config(params)
+        except ChannelConfigError as exc:
+            await channel.send_response(
+                ws,
+                req_id,
+                ok=False,
+                error=str(exc),
+                code="BAD_REQUEST",
+            )
+            return
         try:
             await cm.set_conf("whatsapp", params)
             conf = cm.get_conf("whatsapp")

@@ -1487,6 +1487,10 @@ async def _run(
     from jiuwenswarm.gateway.channel_manager.im_platforms.dingtalk.dingtalk_connect import DingTalkChannel, \
         DingTalkConfig
     from jiuwenswarm.gateway.channel_manager.im_platforms.feishu.feishu_connect import FeishuChannel, FeishuConfig
+    from jiuwenswarm.gateway.channel_manager.im_platforms.whatsapp.bridge_launch import (
+        config_enabled,
+        validate_whatsapp_channel_config,
+    )
     from jiuwenswarm.gateway.channel_manager.im_platforms.whatsapp.whatsapp_connect import WhatsAppChannel, \
         WhatsAppChannelConfig
     from jiuwenswarm.gateway.channel_manager.im_platforms.wechat.wechat_connect import (
@@ -1834,6 +1838,7 @@ async def _run(
         "whatsapp", WhatsAppChannelConfig,
         lambda raw: WhatsAppChannel(_model_config(WhatsAppChannelConfig, raw), _DummyBus()),
         ChannelCapabilities(streaming=True, images=True, files=True),
+        validate_whatsapp_channel_config,
     ))
     channel_manager.register_spec(ChannelSpec(
         "wecom", WecomConfig,
@@ -2789,7 +2794,7 @@ async def _run(
                 default_jid = str(whatsapp_conf.get("default_jid") or "").strip()
                 allow_from = whatsapp_conf.get("allow_from") or []
                 enable_streaming = bool(whatsapp_conf.get("enable_streaming", True))
-                auto_start_bridge = bool(whatsapp_conf.get("auto_start_bridge", False))
+                auto_start_bridge = config_enabled(whatsapp_conf.get("auto_start_bridge", False))
                 bridge_command = str(
                     whatsapp_conf.get("bridge_command") or "node scripts/whatsapp-bridge.js"
                 ).strip()

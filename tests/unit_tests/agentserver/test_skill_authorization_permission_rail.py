@@ -450,7 +450,7 @@ async def test_subagent_tool_permission_card_leads_with_intent_headline(monkeypa
 
     assert captured["header"] == "权限审批: write_file"
     assert captured["question"].startswith("**是否允许「写入 report.md」？**")
-    assert "目的：生成周报" in captured["question"]
+    assert "模型说明（仅供参考）：生成周报" in captured["question"]
     assert "**工具 `write_file` 需要授权才能执行**" in captured["question"]
     assert (
         "> 发起方：子 Agent `child-sess`（当前 Skill：`weekly-report`）"

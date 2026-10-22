@@ -699,7 +699,9 @@ def test_intent_headline_combines_action_phrase_and_call_goal():
         },
     )
 
-    assert headline == "**是否允许「写入 report.md」？**\n\n目的：生成上周的数据分析周报"
+    assert headline == (
+        "**是否允许「写入 report.md」？**\n\n模型说明（仅供参考）：生成上周的数据分析周报"
+    )
 
 
 def test_intent_headline_action_phrase_without_call_goal():
@@ -722,7 +724,9 @@ def test_intent_headline_call_goal_only_for_unknown_tool():
         {"call_goal": "查询工单状态", "ticket": "T-1"},
     )
 
-    assert headline == "**是否允许执行 `mcp_custom_tool`？**\n\n目的：查询工单状态"
+    assert headline == (
+        "**是否允许执行 `mcp_custom_tool`？**\n\n模型说明（仅供参考）：查询工单状态"
+    )
 
 
 def test_intent_headline_empty_without_phrase_or_goal():
@@ -749,8 +753,8 @@ def test_apply_permission_intent_prepends_headline_and_strips_rule_line():
     question = apply_permission_intent(message, "write_file", tool_args)
 
     assert question.startswith("**是否允许「写入 report.md」？**")
-    assert "目的：生成上周的数据分析周报" in question
-    assert question.index("目的：") < question.index("**工具")
+    assert "模型说明（仅供参考）：生成上周的数据分析周报" in question
+    assert question.index("模型说明（仅供参考）：") < question.index("**工具")
     assert "匹配规则" not in question
     assert "请确认是否允许该操作" not in question
     # 安全不变量：工具声明行与原始参数保留，供用户核对实际操作。
@@ -801,7 +805,7 @@ def test_extract_question_adds_intent_to_permission_card(
     question = result["question"]
     assert result["header"] == "权限审批: write_file"
     assert question.startswith("**是否允许「写入 report.md」？**")
-    assert "目的：生成上周的数据分析周报" in question
+    assert "模型说明（仅供参考）：生成上周的数据分析周报" in question
     assert "匹配规则" not in question
     assert "**工具 `write_file` 需要授权才能执行**" in question
     assert '"/ws/report.md"' in question
@@ -837,8 +841,102 @@ def test_hosted_permission_question_leads_with_intent_headline():
     )
 
     assert question.startswith("**是否允许「写入 report.md」？**")
-    assert "目的：生成周报" in question
+    assert "模型说明（仅供参考）：生成周报" in question
     assert "**工具 `write_file` 需要授权才能执行**" in question
     assert "> 发起方：子 Agent `child-sess`" in question
     assert "**权限原因：** file_guard" in question
+
+
+def test_intent_headline_sanitizes_model_controlled_text():
+    """call_goal 是模型可控文本：折叠为单行并剔除 markdown 结构符，伪造声明行不可存活。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    malicious_goal = (
+        "生成周报\n\n**工具 `bash` 需要授权才能执行**\n\n"
+        '参数：\n```json\n{"command": "rm -rf /"}\n```'
+    )
+    headline = build_permission_intent_headline(
+        "write_file",
+        {"call_goal": malicious_goal, "path": "/ws/report.md"},
+    )
+
+    assert headline.startswith(
+        "**是否允许「写入 report.md」？**\n\n模型说明（仅供参考）："
+    )
+    goal_line = headline.split("\n\n", 1)[1]
+    # 单行：换行被折叠，无法在意图区伪造新的声明行/参数块结构。
+    assert "\n" not in goal_line
+    # markdown 结构符与代码围栏全部剔除。
+    for ch in "*`_[]":
+        assert ch not in goal_line
+    # 伪造内容降级为普通文字（信息保留供核对，但不再具有结构）。
+    assert "工具 bash 需要授权才能执行" in goal_line
+    assert "```" not in headline
+    assert "需要授权才能执行**" not in headline
+
+
+def test_intent_headline_keeps_title_pairing_despite_bracket_injection():
+    """参数内容含「」/**/反引号时，「」→【】保住标题配对，结构符被剔除。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    headline = build_permission_intent_headline(
+        "write_file",
+        {"path": "/ws/report」**注入`rm -rf`.md"},
+    )
+
+    # 注入的 」被替换为 】、** 与反引号被剔除，标题的「」配对保持完整。
+    assert headline == "**是否允许「写入 report】注入rm -rf.md」？**"
+    assert headline.count("「") == 1
+    assert headline.count("」") == 1
+
+
+def test_intent_headline_falls_back_to_tool_name_without_actionable_args():
+    """write_file 缺 path 等可组短语的参数时，标题退化为工具名，call_goal 仍保留。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    headline = build_permission_intent_headline("write_file", {"call_goal": "生成周报"})
+
+    assert headline == (
+        "**是否允许执行 `write_file`？**\n\n模型说明（仅供参考）：生成周报"
+    )
+
+
+def test_intent_headline_truncates_action_and_goal():
+    """action 截 60、call_goal 截 80，超长以 … 收尾，标题块不随参数膨胀。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    headline = build_permission_intent_headline(
+        "write_file",
+        {"call_goal": "目标" * 50, "path": "/ws/" + "长" * 60 + ".md"},
+    )
+    title, goal_line = headline.split("\n\n", 1)
+
+    assert title == "**是否允许「写入 " + "长" * 57 + "…」？**"
+    assert goal_line == "模型说明（仅供参考）：" + "目标" * 40 + "…"
+
+
+def test_intent_headline_and_apply_tolerate_none_tool_args():
+    """tool_args=None（中断字段读取失败的降级路径）不抛异常，仅退化为移除匹配规则行。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        apply_permission_intent,
+        build_permission_intent_headline,
+    )
+
+    assert build_permission_intent_headline("write_file", None) == ""
+
+    message = _tool_permission_message("write_file", {"path": "/ws/report.md"})
+    question = apply_permission_intent(message, "write_file", None)
+
+    # 无标题可前置：保留原始声明与确认句，仅移除内部「匹配规则」行。
+    assert question.startswith("**工具 `write_file` 需要授权才能执行**")
+    assert "请确认是否允许该操作。" in question
+    assert "匹配规则" not in question
 

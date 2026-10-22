@@ -277,13 +277,35 @@ def parse_hosted_permission_answer(answer: Any) -> Any:
     return None
 
 
+_HEADLINE_ACTION_MAX = 60
+_HEADLINE_GOAL_MAX = 80
+
+
+def _permission_headline_plain(text: str, max_len: int) -> str:
+    """标题块专用纯文本：单行、无 markdown 结构符、有长度上限。
+
+    action / call_goal 是模型或参数可控文本，直接置顶会在真实声明行上方
+    伪造结构（如换行 + ``**工具 …**`` 假声明、``「」`` 配对被打断）；这里
+    折叠空白为单行、内容中的 ``「」`` 换成 ``【】`` 保证模板配对不被打断、
+    剔除 markdown 控制符并截断（与子代理审批卡防膨胀思路一致）。
+    """
+    collapsed = " ".join(str(text or "").split())
+    collapsed = collapsed.replace("「", "【").replace("」", "】")
+    collapsed = re.sub(r"[*`_\[\]]", "", collapsed)
+    if len(collapsed) > max_len:
+        return collapsed[:max_len] + "…"
+    return collapsed
+
+
 def build_permission_intent_headline(tool_name: str, tool_args: Any) -> str:
     """权限审批卡的意图标题：L1 规则动作短语 + L2 call_goal（模型自述目标）。
 
-    组出形如 ``**是否允许「写入 report.md」？**\\n\\n目的：生成周报`` 的标题块；
-    动作短语与 call_goal 均不可得时返回空串，调用方保持原文案不变。
+    组出形如 ``**是否允许「写入 report.md」？**\\n\\n模型说明（仅供参考）：生成周报``
+    的标题块；动作短语与 call_goal 均不可得时返回空串，调用方保持原文案不变。
     仅做展示增强：审批目标本身（工具声明行与参数区）始终保留，意图不可
-    替代具体操作（模型自述可能被提示词注入包装，用户须能核对原始参数）。
+    替代具体操作（模型自述可能被提示词注入包装，用户须能核对原始参数；
+    故 call_goal 以「模型说明」弱措辞呈现，且 action/call_goal 均经
+    ``_permission_headline_plain`` 清洗，标题块内不得出现伪造的声明结构）。
     """
     name = (tool_name or "").strip()
     if not name:
@@ -294,16 +316,19 @@ def build_permission_intent_headline(tool_name: str, tool_args: Any) -> str:
     )
 
     call_goal, cleaned_args = extract_call_goal(tool_args)
-    action = build_tool_display_name(name, cleaned_args).strip()
+    goal = _permission_headline_plain(call_goal, _HEADLINE_GOAL_MAX)
+    action = _permission_headline_plain(
+        build_tool_display_name(name, cleaned_args), _HEADLINE_ACTION_MAX
+    )
     if action:
         title = f"**是否允许「{action}」？**"
-    elif call_goal:
+    elif goal:
         title = f"**是否允许执行 `{name}`？**"
     else:
         return ""
     parts = [title]
-    if call_goal:
-        parts.append(f"目的：{call_goal}")
+    if goal:
+        parts.append(f"模型说明（仅供参考）：{goal}")
     return "\n\n".join(parts)
 
 

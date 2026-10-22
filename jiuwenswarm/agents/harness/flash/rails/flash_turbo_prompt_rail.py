@@ -4,12 +4,16 @@
 
 from __future__ import annotations
 
+import logging
+
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext
 from openjiuwen.harness.prompts import PromptSection
 
 from jiuwenswarm.agents.harness.common.prompt.prompt_builder import PromptPriority
 from jiuwenswarm.server.runtime.skill_turbo.rails.skill_prompt_rail import SkillTurboPromptRail
 from jiuwenswarm.server.runtime.skill_turbo.region_edit import region_edit_keyword_summary
+
+logger = logging.getLogger(__name__)
 
 # Stable section/tool identifiers; do not import private implementation constants.
 _SECTION_NAME = "skill_turbo_guide"
@@ -31,20 +35,28 @@ class FlashTurboPromptRail(SkillTurboPromptRail):
             return
 
         # Reuse cached discovery; Flash owns its guide without changing the shared rail.
-        from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
-            refresh_skill_acceleration_description,
-        )
+        try:
+            from jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools import (
+                refresh_skill_acceleration_description,
+            )
 
-        skill_names = refresh_skill_acceleration_description()
+            skill_names = refresh_skill_acceleration_description()
+        except Exception as exc:
+            logger.warning("[FlashTurboPromptRail] refresh description failed: %s", exc)
+            skill_names = []
         if not skill_names:
             builder.remove_section(_SECTION_NAME)
             return
-        language = self._resolve_language()
-        builder.add_section(PromptSection(
-            name=_SECTION_NAME,
-            content={language: self._build_guide_text(language, skill_names)},
-            priority=self._resolve_priority(_SECTION_NAME, PromptPriority.SKILL_PROTOCOL),
-        ))
+        try:
+            language = self._resolve_language()
+            builder.add_section(PromptSection(
+                name=_SECTION_NAME,
+                content={language: self._build_guide_text(language, skill_names)},
+                priority=self._resolve_priority(_SECTION_NAME, PromptPriority.SKILL_PROTOCOL),
+            ))
+        except Exception as exc:
+            logger.warning("[FlashTurboPromptRail] build skill_turbo_guide section failed: %s", exc)
+            builder.remove_section(_SECTION_NAME)
 
     def _build_guide_text(self, language: str, skill_names: list[str]) -> str:
         names = "、".join(skill_names) if language == "cn" else ", ".join(skill_names)

@@ -392,3 +392,52 @@ async def test_flash_guide_preserves_priority_and_cleans_up(monkeypatch, skill_r
     rail.uninit(agent)
     assert builder.get_section("skill_turbo_guide") is None
     assert rail.system_prompt_builder is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["import", "refresh", "guide", "priority", "add_section"])
+async def test_flash_guide_runtime_failure_cleans_up_and_recovers(monkeypatch, failure_stage):
+    from jiuwenswarm.agents.harness.flash.rails import flash_turbo_prompt_rail
+
+    rail = flash_turbo_prompt_rail.FlashTurboPromptRail()
+    builder = SystemPromptBuilder(language="cn")
+    builder.add_section(PromptSection(
+        name="skill_turbo_guide", content={"cn": "stale"}, priority=321,
+    ))
+    builder.add_section(PromptSection(name="unrelated", content={"cn": "keep"}, priority=322))
+    agent = SimpleNamespace(system_prompt_builder=builder)
+    rail.init(agent)
+    ctx = SimpleNamespace(agent=agent, inputs=SimpleNamespace(tools=[skill_turbo_tools.skill_turbo.card]))
+    monkeypatch.setattr(skill_turbo_tools, "refresh_skill_acceleration_description", Mock(return_value=["pptx-craft"]))
+    error = ImportError("Turbo refresh import failed") if failure_stage == "import" else RuntimeError(
+        "Turbo guide runtime failure",
+    )
+    warning = Mock()
+    monkeypatch.setattr(flash_turbo_prompt_rail.logger, "warning", warning)
+    with monkeypatch.context() as faults:
+        if failure_stage == "import":
+            original_import = builtins.__import__
+
+            def failing_import(name, *args, **kwargs):
+                if name == "jiuwenswarm.server.runtime.skill_turbo.skill_turbo_tools":
+                    raise error
+                return original_import(name, *args, **kwargs)
+
+            faults.setattr(builtins, "__import__", failing_import)
+        elif failure_stage == "refresh":
+            faults.setattr(skill_turbo_tools, "refresh_skill_acceleration_description", Mock(side_effect=error))
+        elif failure_stage == "guide":
+            faults.setattr(flash_turbo_prompt_rail, "region_edit_keyword_summary", Mock(side_effect=error))
+        elif failure_stage == "priority":
+            faults.setattr(rail, "_resolve_priority", Mock(side_effect=error))
+        else:
+            faults.setattr(builder, "add_section", Mock(side_effect=error))
+        # Call the rail directly so the SDK cannot mask a missing local exception handler.
+        await rail.before_model_call(ctx)
+    assert builder.get_section("skill_turbo_guide") is None
+    assert builder.get_section("unrelated").content == {"cn": "keep"}
+    message = "refresh description" if failure_stage in ("import", "refresh") else "build skill_turbo_guide section"
+    warning.assert_called_once_with(f"[FlashTurboPromptRail] {message} failed: %s", error)
+    await rail.before_model_call(ctx)
+    assert "pptx-craft" in builder.get_section("skill_turbo_guide").content["cn"]
+    assert warning.call_count == 1

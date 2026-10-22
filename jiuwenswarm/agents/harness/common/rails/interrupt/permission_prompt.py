@@ -34,6 +34,7 @@ _ACTION_LABELS = {
     "exec": "执行",
     "list": "列出",
     "access": "访问",
+    "delete": "删除",
 }
 _ACTION_ALIASES = {"edit": "write", "list": "read"}
 
@@ -189,14 +190,28 @@ def build_permission_prompt(
         for path, action, source in operations
         if action in _ACTION_LABELS
     )
+    rule_text = matched_rule if isinstance(matched_rule, str) else ""
+    title_text = risk_title.strip() if isinstance(risk_title, str) and risk_title.strip() else ""
+    is_batch_delete = "del_guard" in rule_text or "批量删除" in title_text
+    if is_batch_delete:
+        # 卡头用批量删除标题；通用「运行程序指令」不再占标题位。
+        # 每条文件操作沿用 core 给出的 action，避免把同一次命令里的写入标成删除。
+        title = title_text or "检测到批量删除，需要确认后才能执行"
+    reason_text = ""
+    raw_reason = metadata.get("ask_reason")
+    if isinstance(raw_reason, str) and raw_reason.strip():
+        reason_text = raw_reason.strip()
+    if is_batch_delete:
+        # ask_reason 原样作为授权原因，不按中文子串决定是否展示。
+        card_reason = reason_text
+    else:
+        card_reason = title_text or presentation.title
     presentation = replace(
         presentation,
         intent=title,
         file_operations=operations,
         risk_level=risk_level,
-        title=risk_title.strip()
-        if isinstance(risk_title, str) and risk_title.strip()
-        else presentation.title,
+        title=card_reason,
     )
 
     parts: list[str] = []
@@ -239,10 +254,14 @@ def build_permission_prompt(
             lambda match: _ACTION_LABELS[match.group(1)] + " ",
             message.strip(),
         )
-    reason = metadata.get("ask_reason")
-    if isinstance(reason, str) and reason.strip() and reason.strip() not in message:
+    # 原因已经作为「授权原因」展示时，不再重复成「授权说明」。
+    if (
+        reason_text
+        and reason_text != card_reason
+        and reason_text not in message
+    ):
         message = "\n\n".join(
-            filter(None, [message, f"授权说明：{_plain_text(reason.strip())}"])
+            filter(None, [message, f"授权说明：{_plain_text(reason_text)}"])
         )
     return title, render_ask_presentation_message(
         presentation,

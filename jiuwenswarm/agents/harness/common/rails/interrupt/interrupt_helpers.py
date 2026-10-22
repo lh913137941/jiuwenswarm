@@ -277,6 +277,55 @@ def parse_hosted_permission_answer(answer: Any) -> Any:
     return None
 
 
+def build_permission_intent_headline(tool_name: str, tool_args: Any) -> str:
+    """权限审批卡的意图标题：L1 规则动作短语 + L2 call_goal（模型自述目标）。
+
+    组出形如 ``**是否允许「写入 report.md」？**\\n\\n目的：生成周报`` 的标题块；
+    动作短语与 call_goal 均不可得时返回空串，调用方保持原文案不变。
+    仅做展示增强：审批目标本身（工具声明行与参数区）始终保留，意图不可
+    替代具体操作（模型自述可能被提示词注入包装，用户须能核对原始参数）。
+    """
+    name = (tool_name or "").strip()
+    if not name:
+        return ""
+    from jiuwenswarm.common.tool_display import (
+        build_tool_display_name,
+        extract_call_goal,
+    )
+
+    call_goal, cleaned_args = extract_call_goal(tool_args)
+    action = build_tool_display_name(name, cleaned_args).strip()
+    if action:
+        title = f"**是否允许「{action}」？**"
+    elif call_goal:
+        title = f"**是否允许执行 `{name}`？**"
+    else:
+        return ""
+    parts = [title]
+    if call_goal:
+        parts.append(f"目的：{call_goal}")
+    return "\n\n".join(parts)
+
+
+_PERMISSION_RULE_LINE_RE = re.compile(r"\n\n匹配规则：`[^`\n]*`")
+_PERMISSION_CONFIRM_SENTENCE = "请确认是否允许该操作。\n\n"
+
+
+def apply_permission_intent(message: str, tool_name: str, tool_args: Any) -> str:
+    """主 Agent 权限卡 question 头部加入意图标题，并移除内部「匹配规则」行。
+
+    只做前置与删减：不改动「**工具 `X` 需要授权才能执行**」声明行与参数区
+    （TUI ``PERMISSION_TOOL_RE`` / 前端 ``approvalPresentation`` 的既有解析依赖
+    它们）。无意图可展示时仅移除「匹配规则」行。
+    """
+    headline = build_permission_intent_headline(tool_name, tool_args)
+    cleaned = _PERMISSION_RULE_LINE_RE.sub("", message)
+    if headline:
+        cleaned = cleaned.replace(_PERMISSION_CONFIRM_SENTENCE, "", 1)
+        cleaned = f"{headline}\n\n{cleaned}"
+    return cleaned
+
+
 def _format_hosted_permission_question(
     *,
     tool_name: str,
@@ -288,7 +337,11 @@ def _format_hosted_permission_question(
         _format_tool_args_preview,
     )
 
-    parts = [
+    parts = []
+    headline = build_permission_intent_headline(tool_name, tool_args)
+    if headline:
+        parts += [headline, "\n\n"]
+    parts += [
         f"**工具 `{tool_name}` 需要授权才能执行**\n\n",
         f"> 发起方：子 Agent `{agent_scope_id}`",
         "\n\n**关键参数或命令：**\n\n",
@@ -1406,6 +1459,8 @@ def extract_question_from_interaction(payload: Any) -> dict | None:
     else:
         header = f"权限审批: {tool_name}" if tool_name else "权限审批"
         question = message
+        if source == "permission_interrupt":
+            question = apply_permission_intent(question, tool_name, tool_args)
         if is_enterprise() and source == "permission_interrupt":
             question = _strip_permanent_remember_hint(question)
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -666,4 +667,178 @@ async def test_hosted_permission_rail_hook_registry_emit_resolve_roundtrip(
         TOOL_PERMISSION_CHANNEL_ID.reset(token_channel)
         context_vars.reset_subagent_parent_session(token_parent)
         SubagentApprovalRegistry.reset_instance_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# 权限审批卡意图标题（build_permission_intent_headline / apply_permission_intent）
+# ---------------------------------------------------------------------------
+
+
+def _tool_permission_message(tool_name: str, tool_args: dict) -> str:
+    """Mirror agent-core PermissionInterruptRail._build_message output shape."""
+    args_preview = json.dumps(tool_args, ensure_ascii=False, indent=2)
+    return (
+        f"**工具 `{tool_name}` 需要授权才能执行**\n\n"
+        "请确认是否允许该操作。\n\n"
+        f"参数：\n```json\n{args_preview}\n```\n"
+        f"\n匹配规则：`permission_engine`"
+    )
+
+
+def test_intent_headline_combines_action_phrase_and_call_goal():
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    headline = build_permission_intent_headline(
+        "write_file",
+        {
+            "call_goal": "生成上周的数据分析周报",
+            "path": "/ws/report.md",
+            "content": "# 周报",
+        },
+    )
+
+    assert headline == "**是否允许「写入 report.md」？**\n\n目的：生成上周的数据分析周报"
+
+
+def test_intent_headline_action_phrase_without_call_goal():
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    headline = build_permission_intent_headline("bash", {"command": "ls -la /tmp"})
+
+    assert headline == "**是否允许「执行 ls -la /tmp」？**"
+
+
+def test_intent_headline_call_goal_only_for_unknown_tool():
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    headline = build_permission_intent_headline(
+        "mcp_custom_tool",
+        {"call_goal": "查询工单状态", "ticket": "T-1"},
+    )
+
+    assert headline == "**是否允许执行 `mcp_custom_tool`？**\n\n目的：查询工单状态"
+
+
+def test_intent_headline_empty_without_phrase_or_goal():
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    assert build_permission_intent_headline("mcp_custom_tool", {"command": "x"}) == ""
+    assert build_permission_intent_headline("", {"call_goal": "x"}) == ""
+
+
+def test_apply_permission_intent_prepends_headline_and_strips_rule_line():
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        apply_permission_intent,
+    )
+
+    tool_args = {
+        "call_goal": "生成上周的数据分析周报",
+        "path": "/ws/report.md",
+        "content": "# 周报",
+    }
+    message = _tool_permission_message("write_file", tool_args)
+
+    question = apply_permission_intent(message, "write_file", tool_args)
+
+    assert question.startswith("**是否允许「写入 report.md」？**")
+    assert "目的：生成上周的数据分析周报" in question
+    assert question.index("目的：") < question.index("**工具")
+    assert "匹配规则" not in question
+    assert "请确认是否允许该操作" not in question
+    # 安全不变量：工具声明行与原始参数保留，供用户核对实际操作。
+    assert "**工具 `write_file` 需要授权才能执行**" in question
+    assert '"/ws/report.md"' in question
+
+
+def test_apply_permission_intent_degrades_to_rule_line_removal_only():
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        apply_permission_intent,
+    )
+
+    tool_args = {"command": "ls -la /tmp"}
+    message = _tool_permission_message("mcp_custom_tool", tool_args)
+
+    question = apply_permission_intent(message, "mcp_custom_tool", tool_args)
+
+    # 词典外工具且无 call_goal：无标题，仅移除内部「匹配规则」行，其余不变。
+    assert question.startswith("**工具 `mcp_custom_tool` 需要授权才能执行**")
+    assert "匹配规则" not in question
+    assert "请确认是否允许该操作。" in question
+    assert "ls -la /tmp" in question
+
+
+def test_extract_question_adds_intent_to_permission_card(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from jiuwenswarm.agents.harness.common.rails.interrupt import interrupt_helpers as helpers
+
+    monkeypatch.setattr(helpers, "is_enterprise", lambda: False)
+    tool_args = {
+        "call_goal": "生成上周的数据分析周报",
+        "path": "/ws/report.md",
+        "content": "# 周报",
+    }
+    interaction = SimpleNamespace(
+        id="call_intent_1",
+        value={
+            "message": _tool_permission_message("write_file", tool_args),
+            "tool_name": "write_file",
+            "tool_args": tool_args,
+        },
+    )
+
+    result = helpers.extract_question_from_interaction(interaction)
+
+    assert result is not None
+    question = result["question"]
+    assert result["header"] == "权限审批: write_file"
+    assert question.startswith("**是否允许「写入 report.md」？**")
+    assert "目的：生成上周的数据分析周报" in question
+    assert "匹配规则" not in question
+    assert "**工具 `write_file` 需要授权才能执行**" in question
+    assert '"/ws/report.md"' in question
+    assert {"本次允许", "拒绝"} <= {opt["label"] for opt in result["options"]}
+
+
+def test_extract_question_keeps_non_permission_interrupt_untouched():
+    """确认类中断（confirm_interrupt）不经过意图改写。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt import interrupt_helpers as helpers
+
+    interaction = SimpleNamespace(
+        id="call_confirm_1",
+        value={"message": "确认执行该任务？", "tool_name": "switch_mode"},
+    )
+
+    result = helpers.extract_question_from_interaction(interaction)
+
+    assert result is not None
+    assert result["header"] == "操作确认: switch_mode"
+    assert result["question"] == "确认执行该任务？"
+
+
+def test_hosted_permission_question_leads_with_intent_headline():
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        _format_hosted_permission_question,
+    )
+
+    question = _format_hosted_permission_question(
+        tool_name="write_file",
+        tool_args={"call_goal": "生成周报", "path": "/ws/report.md"},
+        reason="file_guard",
+        agent_scope_id="child-sess",
+    )
+
+    assert question.startswith("**是否允许「写入 report.md」？**")
+    assert "目的：生成周报" in question
+    assert "**工具 `write_file` 需要授权才能执行**" in question
+    assert "> 发起方：子 Agent `child-sess`" in question
+    assert "**权限原因：** file_guard" in question
 

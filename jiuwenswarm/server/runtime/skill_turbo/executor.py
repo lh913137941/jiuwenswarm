@@ -142,7 +142,7 @@ def resolve_skill_turbo_thinking_kwargs(
 ) -> dict[str, Any]:
     """Optional thinking inject for SkillTurbo LLM calls.
 
-    ``thinking is None`` → ``default`` (GLM-5.3 family → product depth low;
+    ``thinking is None`` → ``default`` (GLM-5.3 / Kimi K3 → product depth low;
     other models → no inject). Unsupported / degraded → empty dict (never abort).
     """
     if thinking is None:

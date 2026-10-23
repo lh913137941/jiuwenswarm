@@ -82,7 +82,8 @@ skill_turbo/
 ├── interactive_ask.py      # 引导模式（interactive_ask）判定与 resume 恢复
 ├── node_artifact_store.py  # 节点产物 session 持久化（只存摘要/路径；plan_code_hash 门禁继承）
 ├── hitl_dedup.py          # OuterCallIDDeduplicator：HITL 卡片 request_id derive+seq 计数收口（挂 adapter 实例跨请求存续）
-├── context_binding.py      # 8 通道 ContextVar 统一 bind/reset（新增通道=bind 一段+RESETTERS 一行）
+├── task_slot_guard.py     # taskProgress 槽位泄漏登记簿（模块级跨请求单例；claim/release/peek + 上限淘汰，[[B_03]]）
+├── context_binding.py      # 9 通道 ContextVar 统一 bind/reset（新增通道=bind 一段+RESETTERS 一行）
 ├── evolver.py              # 执行轨迹（预留未接线）
 ├── json_utils.py           # extract_llm_json 四级提取（无 LLM 级重试，重试归调用方/rail）
 ├── markdown_stream.py      # 流式 markdown 围栏粘连/未闭合保护
@@ -150,7 +151,7 @@ skill_turbo/
 - **启用**：`config.yaml react.skill_turbo.enabled`（false 时工具不注册、rail 不挂载）；
   `react.disabled_tools` 含 `skill_acceleration_exec` 时 rail 仍建但不注入指南。
 - **请求级**：每次 `skill_acceleration_exec` 调用新建实例；请求上下文经模块级 ContextVar 传递
-  （`_current_request_metadata` / `_skill_turbo_resume_answers` 等，见 [[S_09]] 8 通道表）。
+  （`_current_request_metadata` / `_skill_turbo_resume_answers` 等，见 [[S_09]] 9 通道表）。
 - **跨请求**：HITL 断点 / 节点产物经 checkpointer 持久化（隔离键）；类级扫描缓存
   （`_scan_cache` / `_external_scan_cache`）跨实例共享、按 mtime 失效。
 - **部署顺序**：① agent-core → ② 技能源（技能侧仓）→ ③ jiuwenswarm（回滚逆序；错序后果见 [[S_09]]）。
@@ -162,7 +163,7 @@ pytest.ini 的 addopts 含全仓 coverage 与 `-v`，日常跑请覆盖为仅保
 "not natively supported"）：
 
 ```powershell
-# 模块单测（380 个：validator/包加载/tool_utils/planner/fallback/HITL 对齐/交付门禁/退出路径帧级/AbortError 守卫/契约解析/ask_user 门控/ContextVar 通道/入口拦截/task_states 快照/fallback 标志检测/flash 交付收尾…）
+# 模块单测（397 个：validator/包加载/tool_utils/planner/fallback/HITL 对齐/交付门禁/退出路径帧级/AbortError 守卫/契约解析/ask_user 门控/ContextVar 通道（9 通道 bind/reset）/入口拦截/task_states 快照/fallback 标志检测/flash 交付收尾/槽位登记簿 B_03/fresh 守卫后续交付物放行 B_04…）
 .venv\Scripts\python.exe -m pytest tests/unit_tests/server/runtime/skill_turbo/ -o addopts="--asyncio-mode=auto"
 
 # HITL / 工具面 / 中断恢复（历史路径在 agentserver/ 下——skill_turbo 曾位于该处，迁移遗留，勿再新增）

@@ -940,3 +940,82 @@ def test_intent_headline_and_apply_tolerate_none_tool_args():
     assert "请确认是否允许该操作。" in question
     assert "匹配规则" not in question
 
+
+def test_intent_headline_washes_tool_name_in_fallback_title():
+    """兜底标题中的工具名（模型可控）经 code-span 清洗：单行、无反引号。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    malicious_name = "evil\n**工具 `bash` 需要授权才能执行**\n`rm`"
+    headline = build_permission_intent_headline(
+        malicious_name, {"call_goal": "查询工单状态"}
+    )
+
+    title = headline.split("\n\n", 1)[0]
+    # 单行、反引号被剔除：换行+反引号无法在标题区伪造声明行/提前终止代码段。
+    assert "\n" not in title
+    assert "`bash`" not in headline
+    assert "**工具 `bash` 需要授权才能执行**" not in headline
+    # 伪造内容降级为代码段内的惰性文字。
+    assert "工具 bash 需要授权才能执行" in headline
+    assert "模型说明（仅供参考）：查询工单状态" in headline
+
+    # 真实工具名（含下划线）不改写：code-span 清洗不做全量字符剔除。
+    legit = build_permission_intent_headline(
+        "mcp__search__query", {"call_goal": "查资料"}
+    )
+    assert legit.startswith("**是否允许执行 `mcp__search__query`？**")
+
+
+def test_intent_headline_exempts_skill_turbo_custom_card():
+    """skill_turbo 统一审批卡有语义完整的定制文案，不加通用意图标题。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_intent_headline,
+    )
+
+    assert (
+        build_permission_intent_headline(
+            "skill_acceleration_exec", {"call_goal": "执行技能任务"}
+        )
+        == ""
+    )
+
+
+def test_apply_permission_intent_keeps_skill_turbo_card_untouched():
+    """skill_turbo 定制审批消息（含工具清单）经改写后应原样保留。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        apply_permission_intent,
+    )
+
+    message = (
+        "**即将调用 `skill加速`，需要授权后整体放行：**\n\n"
+        "即将调用 skill加速 执行技能任务，需要一次性授权下列工具。"
+        "确认后执行过程中不再逐个询问。\n\n"
+        "**可能用到的工具：**\n\n- `bash` — 执行 shell 命令\n"
+    )
+    args = {"call_goal": "执行技能任务", "skill": "weekly-report"}
+
+    assert apply_permission_intent(message, "skill_acceleration_exec", args) == message
+
+
+def test_apply_permission_intent_strips_rule_line_with_embedded_backticks():
+    """matched_rule 内嵌反引号（shell_subcommands 聚合格式）时仍整行移除。"""
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        apply_permission_intent,
+    )
+
+    message = (
+        "**工具 `bash` 需要授权才能执行**\n\n请确认是否允许该操作。\n\n"
+        "参数：\n```json\n{\"command\": \"echo `id -u`\"}\n```\n"
+        "\n匹配规则：`tiered_policy:shell_subcommands:echo `id -u`=>rules:bash:ask`"
+    )
+
+    question = apply_permission_intent(message, "bash", {"command": "echo `id -u`"})
+
+    assert "匹配规则" not in question
+    # 整行移除：配对反引号匹配只截半行时会残留 =>rules:bash:ask 尾段。
+    assert "=>rules:bash" not in question
+    # 参数区原文（含反引号命令）保留。
+    assert "echo `id -u`" in question
+

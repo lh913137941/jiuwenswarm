@@ -280,6 +280,11 @@ def parse_hosted_permission_answer(answer: Any) -> Any:
 _HEADLINE_ACTION_MAX = 60
 _HEADLINE_GOAL_MAX = 80
 
+# 这些工具的审批卡由专用 rail 产出语义完整的定制文案（skill_turbo 的
+# 工具清单统一授权卡），通用意图标题叠上去只会破坏其定制语义（下游 BFF
+# 以首行文案识别品牌卡），一律豁免。
+_INTENT_HEADLINE_EXEMPT_TOOLS = frozenset({"skill_acceleration_exec"})
+
 
 def _permission_headline_plain(text: str, max_len: int) -> str:
     """标题块专用纯文本：单行、无 markdown 结构符、有长度上限。
@@ -297,18 +302,34 @@ def _permission_headline_plain(text: str, max_len: int) -> str:
     return collapsed
 
 
+def _permission_headline_code_span(text: str) -> str:
+    """反引号代码段专用清洗：折叠为单行、剔除反引号，其余原样。
+
+    工具名与 action/call_goal 同属模型可控文本，但它落入 `` `…` `` 代码段：
+    换行会伪造行结构、反引号会提前终止代码段，须清洗；``_`` 等在代码段内
+    原样渲染且是真实工具名的合法字符（如 ``mcp__server__tool``），不做
+    ``_permission_headline_plain`` 式全量清洗以免改写工具名。
+    """
+    collapsed = " ".join(str(text or "").split()).replace("`", "")
+    if len(collapsed) > _HEADLINE_ACTION_MAX:
+        return collapsed[:_HEADLINE_ACTION_MAX] + "…"
+    return collapsed
+
+
 def build_permission_intent_headline(tool_name: str, tool_args: Any) -> str:
     """权限审批卡的意图标题：L1 规则动作短语 + L2 call_goal（模型自述目标）。
 
     组出形如 ``**是否允许「写入 report.md」？**\\n\\n模型说明（仅供参考）：生成周报``
     的标题块；动作短语与 call_goal 均不可得时返回空串，调用方保持原文案不变。
-    仅做展示增强：审批目标本身（工具声明行与参数区）始终保留，意图不可
-    替代具体操作（模型自述可能被提示词注入包装，用户须能核对原始参数；
+    ``_INTENT_HEADLINE_EXEMPT_TOOLS`` 内的工具（skill_turbo 统一审批等定制卡）
+    同样返回空串。仅做展示增强：审批目标本身（工具声明行与参数区）始终保留，
+    意图不可替代具体操作（模型自述可能被提示词注入包装，用户须能核对原始参数；
     故 call_goal 以「模型说明」弱措辞呈现，且 action/call_goal 均经
-    ``_permission_headline_plain`` 清洗，标题块内不得出现伪造的声明结构）。
+    ``_permission_headline_plain`` 清洗、兜底分支的工具名经
+    ``_permission_headline_code_span`` 清洗，标题块内不得出现伪造的声明结构）。
     """
     name = (tool_name or "").strip()
-    if not name:
+    if not name or name in _INTENT_HEADLINE_EXEMPT_TOOLS:
         return ""
     from jiuwenswarm.common.tool_display import (
         build_tool_display_name,
@@ -323,7 +344,10 @@ def build_permission_intent_headline(tool_name: str, tool_args: Any) -> str:
     if action:
         title = f"**是否允许「{action}」？**"
     elif goal:
-        title = f"**是否允许执行 `{name}`？**"
+        name_plain = _permission_headline_code_span(name)
+        if not name_plain:
+            return ""
+        title = f"**是否允许执行 `{name_plain}`？**"
     else:
         return ""
     parts = [title]
@@ -332,7 +356,13 @@ def build_permission_intent_headline(tool_name: str, tool_args: Any) -> str:
     return "\n\n".join(parts)
 
 
-_PERMISSION_RULE_LINE_RE = re.compile(r"\n\n匹配规则：`[^`\n]*`")
+# 跨仓库契约：以下两常量与 agent-core ``tool_security_rail._build_message`` 的
+# 输出文案逐字符耦合（「匹配规则：`{rule}`」行与「请确认是否允许该操作。」句）。
+# 上游文案演化时此处静默失效——仅表现为对应行/句保留在卡片上，无功能破坏；
+# 变更 agent-core 文案时需同步此处与测试夹具 ``_tool_permission_message``。
+# 规则行匹配到行尾（``[^\n]*``）而非配对反引号：shell_subcommands 聚合规则
+# 内嵌模型可控的命令文本、可携带反引号，配对匹配会失配或只截掉半行。
+_PERMISSION_RULE_LINE_RE = re.compile(r"\n\n匹配规则：[^\n]*")
 _PERMISSION_CONFIRM_SENTENCE = "请确认是否允许该操作。\n\n"
 
 

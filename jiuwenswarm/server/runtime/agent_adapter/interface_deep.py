@@ -10635,6 +10635,10 @@ class JiuWenSwarmDeepAdapter:
         # Disabled tools are enforced by DisabledToolsRail on parent + inherited
         # onto general-purpose (stock agent-core copies non-SubagentRail rails);
         # do not pass disabled_tools= here — older openjiuwen factory rejects it.
+        from jiuwenswarm.agents.harness.common.tools.subagent_executor.excluded_spawn_tools import (
+            filter_excluded_spawn_tools,
+        )
+
         configured_subagents = _inject_general_purpose_subagent(
             configured_subagents,
             add_general_purpose_agent=should_add_general_agent,
@@ -10643,7 +10647,8 @@ class JiuWenSwarmDeepAdapter:
             system_prompt=build_agent_identity_prompt(
                 language=self._resolve_prompt_language(),
             ),
-            tools=normalized_tool_cards,
+            # 子 Agent 不得继承 send_file_to_user 等主 Agent 专属工具。
+            tools=filter_excluded_spawn_tools(normalized_tool_cards),
             mcps=None,
             model=model,
             skills=None,

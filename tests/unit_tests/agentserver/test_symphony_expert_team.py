@@ -213,7 +213,7 @@ async def test_planning_omits_skill_names_but_preserves_executable_template(tmp_
     round_state = expert_team.DynamicExpertRound(FakeAgent(), "请专家写报告", model)
     result = await round_state.compose("请专家写报告")
 
-    assert result == {"success": True, "status": "no_plan"}
+    assert result == {"success": True, "status": "no_plan", "reason": "no_suitable_plan"}
     model.invoke.assert_awaited_once()
     payload = json.loads(model.invoke.await_args.kwargs["messages"][1]["content"])
     assert payload["experts"] == [{
@@ -403,7 +403,9 @@ async def test_no_available_experts_skips_core_model_and_binding(monkeypatch):
     monkeypatch.setattr(expert_team, "scan_local_experts", scan)
     monkeypatch.setattr(expert_team, "_subagent_config", lambda _agent, expert, _model: expert.id)
     round_state = expert_team.DynamicExpertRound(FakeAgent(), "普通任务", object())
-    assert await round_state.compose("普通任务") == {"success": True, "status": "no_plan"}
+    assert await round_state.compose("普通任务") == {
+        "success": True, "status": "no_plan", "reason": "no_available_experts",
+    }
     assert round_state.plan is None
 
 

@@ -6339,6 +6339,14 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         # 实例，不会再往下递归。
         return adapter.get_live_session_instance(session_id)
 
+    def get_dynamic_expert_notice_state(self, session_id: str) -> Any | None:
+        """Return the current round's text state without creating a runtime."""
+        if not self._is_session_scoped_adapter:
+            adapter = self._get_cached_session_adapter(session_id)
+            return adapter.get_dynamic_expert_notice_state(session_id) if adapter is not None else None
+        round_state = self._dynamic_expert_rounds.get(session_id)
+        return round_state.notice_state if round_state is not None else None
+
     async def ensure_instance(self) -> Any:
         """Return this adapter's own DeepAgent, building it on first use.
 
@@ -8469,7 +8477,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
     def _prepare_confirmation_resume(
         self, session_id: str, params: dict[str, Any], inputs: dict[str, Any],
     ) -> bool:
-        """Validate the displayed plan ID, then restore Core's original interrupt ID."""
+        """Validate the displayed expert choice ID, then restore Core's interrupt ID."""
         from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
         from jiuwenswarm.symphony.expert_confirmation import pending_confirmation
         from jiuwenswarm.symphony.expert_team import CONFIRMATION_NONCE_KEY, PLAN_TOOL_NAME
@@ -11203,6 +11211,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     dynamic_expert_round = DynamicExpertRound(
                         self._instance, query, resolved_model, session_id=session_id,
                         handoff_expert=self._handoff_confirmed_expert,
+                        supports_user_interaction=inputs.get("supports_user_interaction") is not False,
                     )
                     self._dynamic_expert_rounds[session_id] = dynamic_expert_round
 

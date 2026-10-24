@@ -1290,7 +1290,7 @@ class JiuWenSwarm:
             empty_expert_answer = (
                 answers == [] and params.get("source") == "confirm_interrupt"
                 and isinstance(params.get("request_id"), str)
-                and params["request_id"].startswith("symphony-plan:")
+                and params["request_id"].startswith(("symphony-plan:", "symphony-no-plan:"))
             )
             if answers or empty_expert_answer:
                 request_id = params.get("request_id", "")
@@ -1641,6 +1641,28 @@ class JiuWenSwarm:
         custom_input = answer.get("custom_input", "") if isinstance(answer, dict) else ""
 
         value = selected_options[0] if selected_options else ""
+
+        if source == "confirm_interrupt" and request_id.startswith("symphony-no-plan:"):
+            from jiuwenswarm.symphony.expert_team import EXPERT_PLAN_ACTION_KEY
+
+            no_plan_actions = {
+                "continue": "continue", "summon": "summon",
+                "小艺Work继续": "continue", "去召唤专家": "summon",
+            }
+            action = (
+                no_plan_actions.get(value, "invalid")
+                if isinstance(selected_options, list) and len(selected_options) == 1
+                and not str(custom_input or "").strip() else "invalid"
+            )
+            interactive_input.update(request_id, {
+                "approved": action != "invalid", "auto_confirm": False,
+                "feedback": "", EXPERT_PLAN_ACTION_KEY: action,
+            })
+            logger.info(
+                "[JiuWenSwarm] expert no-plan answer: request_id=%s action=%s",
+                request_id, action,
+            )
+            return interactive_input
 
         if source == "confirm_interrupt" and request_id.startswith("symphony-plan:"):
             from jiuwenswarm.symphony.expert_team import EXPERT_PLAN_ACTION_KEY
@@ -2656,6 +2678,12 @@ class JiuWenSwarm:
         durable_pending_final_extra: dict[str, Any] = {}
         durable_pending_reasoning_chunks: list[str] = []
         durable_final_content = ""
+        expert_notice_stream = None
+
+        def _notice_history_content(content: str) -> str:
+            if expert_notice_stream is not None:
+                return expert_notice_stream.history_content(content)
+            return content
 
         def _consume_durable_reasoning_content() -> str:
             nonlocal durable_pending_reasoning_chunks
@@ -2671,12 +2699,29 @@ class JiuWenSwarm:
             merged["reasoning_content"] = reasoning_text
             return merged
 
+        def _defer_notice_final(payload: dict[str, Any]) -> None:
+            nonlocal durable_pending_final_chunks
+            durable_pending_final_chunks = [str(payload.get("content") or "")]
+            # A trailing empty final can update usage without repeating model
+            # metadata. Keep supplied fields until this segment is persisted.
+            durable_pending_final_extra.update({
+                key: value for key, value in payload.items()
+                if key not in {
+                    "event_type", "content", "role", "member_name", "id",
+                    "request_id", "session_id", "channel_id", "timestamp", "mode",
+                }
+            })
+
         def _persist_pending_final_text(aborted: bool = False) -> None:
             nonlocal durable_pending_final_chunks, durable_pending_final_extra, durable_final_content
             pending_text = "".join(durable_pending_final_chunks)
             durable_pending_final_chunks = []
             extra_fields = durable_pending_final_extra
             durable_pending_final_extra = {}
+            if pending_text and expert_notice_stream is not None and expert_notice_stream.active:
+                # Full snapshots share a prefix within this request. A HITL
+                # continuation persists only its new suffix under the new rid.
+                pending_text = _notice_history_content(expert_notice_stream.text)
             # 取消终态独立于正文：工具阶段/零正文也必须留痕。
             if not aborted and (not pending_text or (pending_text == durable_final_content and not extra_fields)):
                 return
@@ -2727,6 +2772,8 @@ class JiuWenSwarm:
             logger.info("[JiuWenSwarm] run_stream_task started: request_id=%s session_id=%s", rid, session_id)
             _put_count = 0
             producer_stream: AsyncIterator[AgentResponseChunk] | None = None
+            notice_state = None
+            get_notice_state = getattr(adapter, "get_dynamic_expert_notice_state", None)
             try:
                 from jiuwenswarm.server.runtime.expert.expert_service import history_expert_identity_extra
 
@@ -2767,7 +2814,11 @@ class JiuWenSwarm:
                             "[JiuWenSwarm] run_stream_task chunk #%s: request_id=%s event_type=%s",
                             _put_count, rid, _et,
                         )
-                    await stream_queue.put(("chunk", chunk))
+                    if not is_team_mode and callable(get_notice_state):
+                        # Capture while the round is live. It may close before
+                        # the bounded queue's consumer reaches its final frame.
+                        notice_state = get_notice_state(session_id) or notice_state
+                    await stream_queue.put(("chunk", (chunk, notice_state)))
             except asyncio.CancelledError as exc:
                 producer_cancellation = exc
                 logger.info("[JiuWenSwarm] 流式任务被取消: request_id=%s session_id=%s", rid, session_id)
@@ -2853,6 +2904,12 @@ class JiuWenSwarm:
                     continue
 
                 event_type, data = item
+                if event_type == "chunk":
+                    data, notice_state = data
+                    if expert_notice_stream is None and notice_state is not None:
+                        from jiuwenswarm.symphony.expert_notice import ExpertNoticeStream
+
+                        expert_notice_stream = ExpertNoticeStream(notice_state)
                 _yielded_from_queue += 1
                 if _yielded_from_queue <= 3:
                     _pl = getattr(data, "payload", None) if event_type == "chunk" else None
@@ -2901,6 +2958,22 @@ class JiuWenSwarm:
                         is_complete=False,
                     )
                 else:
+                    payload = data.payload if isinstance(data, AgentResponseChunk) else data
+                    if expert_notice_stream is not None and isinstance(payload, dict):
+                        updated_payload, notice_delta = expert_notice_stream.consume(payload)
+                        if updated_payload is not payload:
+                            data = (
+                                replace(data, payload=updated_payload)
+                                if isinstance(data, AgentResponseChunk) else updated_payload
+                            )
+                        if notice_delta:
+                            final_answer_chunks.append(notice_delta)
+                            durable_pending_final_chunks.append(notice_delta)
+                            yield AgentResponseChunk(
+                                request_id=rid, channel_id=cid,
+                                payload={"event_type": "chat.delta", "content": notice_delta},
+                                is_complete=False,
+                            )
                     if isinstance(data, AgentResponseChunk):
                         if suppress_a2ui_stream:
                             data = _normalize_nested_stream_chunk(data)
@@ -3025,7 +3098,14 @@ class JiuWenSwarm:
                                         final_answer_chunks.clear()
                                     durable_pending_final_chunks = []
                                     continue
-                                durable_pending_final_chunks = []
+                                if expert_notice_stream is not None and expert_notice_stream.active:
+                                    # Finals can replace one segment with unrelated
+                                    # text. Persist its last snapshot at a boundary.
+                                    if not data.payload.get("member_name"):
+                                        _defer_notice_final(data.payload)
+                                        should_record = False
+                                else:
+                                    durable_pending_final_chunks = []
 
                             # 团队成员帧（member_name 归属）的落盘所有权在 team_helpers
                             # （_persist_member_final_output/_persist_member_tool_event，
@@ -3186,7 +3266,12 @@ class JiuWenSwarm:
                                     final_answer_chunks.clear()
                                 durable_pending_final_chunks = []
                                 continue
-                            durable_pending_final_chunks = []
+                            if expert_notice_stream is not None and expert_notice_stream.active:
+                                if not data.get("member_name"):
+                                    _defer_notice_final(data)
+                                    should_record = False
+                            else:
+                                durable_pending_final_chunks = []
 
                         # 团队成员帧（member_name 归属）由 team_helpers 成员归因落盘负责，
                         # 通用路径跳过防双写（与上方 chunk 分支同规）
@@ -3243,6 +3328,10 @@ class JiuWenSwarm:
             # 生产者自行取消时也走同一收尾；不能在 try 外直接 raise 丢失留痕。
             if producer_cancellation is not None:
                 raise producer_cancellation
+            if expert_notice_stream is not None and expert_notice_stream.active:
+                # An unrelated HITL or a subsequent error can end the output
+                # stream without a model final. Keep the already-visible notice.
+                _persist_pending_final_text()
         except (asyncio.CancelledError, GeneratorExit) as exc:
             # 中断/停止留痕：pending 缓冲里是本轮已流式的半截正文（思考随
             # _persist_pending_final_text 一并附挂，aborted 标记"已停止"语义），
@@ -3331,7 +3420,7 @@ class JiuWenSwarm:
                 channel_id=cid,
                 role="assistant",
                 event_type="chat.final",
-                content=finalized_assistant_message,
+                content=_notice_history_content(finalized_assistant_message),
                 timestamp=time.time(),
                 extra=_attach_reasoning_content({
                     **{

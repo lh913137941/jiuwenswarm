@@ -34,6 +34,7 @@ from jiuwenswarm.server.runtime.expert.expert_store import (
     LocalDirExpertPackageSource,
 )
 from jiuwenswarm.symphony.expert_skills import DynamicExpertSkillRail, snapshot_public_skills
+from jiuwenswarm.symphony.expert_notice import ExpertNoticeState
 
 
 logger = logging.getLogger(__name__)
@@ -203,6 +204,7 @@ class DynamicExpertRound:
     def __init__(
         self, agent: Any, query: str, model: Any, *, session_id: str = "",
         handoff_expert: Callable[[DynamicExpertRound, LocalExpert], Awaitable[list[str]]] | None = None,
+        supports_user_interaction: bool = True,
     ) -> None:
         self.agent = agent
         self.query = query
@@ -211,10 +213,12 @@ class DynamicExpertRound:
         self.model = model
         self.session_id = session_id
         self._handoff_expert = handoff_expert
+        self.supports_user_interaction = supports_user_interaction
         self._handoff_tool_names: list[str] = []
         self.plan: dict[str, Any] | None = None
         self.pending_plan: dict[str, Any] | None = None
         self.candidate_count = 0
+        self.notice_state = ExpertNoticeState()
         self.feedback = ""
         self._selected_experts: dict[str, LocalExpert] = {}
         self._selected_configs: dict[str, SubAgentConfig] = {}
@@ -278,7 +282,10 @@ class DynamicExpertRound:
                 finally:
                     self._planner_task = None
                 if plan["status"] == "no_plan":
-                    self.response = {"success": True, **plan}
+                    self.response = {
+                        "success": True, **plan,
+                        "reason": "no_available_experts" if not available else "no_suitable_plan",
+                    }
                     return self.response
                 if plan["status"] != "ready":
                     raise ValueError(f"invalid expert plan status: {plan['status']}")
@@ -368,6 +375,8 @@ class DynamicExpertRound:
                 ),
                 "feedback_placeholder": "想调整人选或分工？告诉小艺Work…",
             }
+        if 1 <= self.candidate_count <= 5:
+            display["candidate_hint"] = "当前可用的专家还不多，去「专家·专家团」召唤更多专家吧。"
         return {
             "plan_id": plan_id, "candidate_count": self.candidate_count,
             "members": members, "display": display,
@@ -377,17 +386,37 @@ class DynamicExpertRound:
         self, session_id: str, call_id: str, *, session: Any = None,
     ) -> dict[str, str] | None:
         """Tie the saved plan to one live session and the original tool call."""
-        if self._closed or self.pending_plan is None or not session_id or not call_id:
+        if self.pending_plan is None:
+            return None
+        return self._register_confirmation("dynamic_expert_plan_id", session_id, call_id, session)
+
+    def request_no_plan_confirmation(
+        self, session_id: str, call_id: str, *, session: Any = None,
+    ) -> dict[str, str] | None:
+        """Ask once for an eligible no-plan result without changing other flows."""
+        if (self.pending_plan is not None
+                or not self.response or self.response.get("status") != "no_plan"
+                or self.response.get("decision") is not None
+                or not self.supports_user_interaction):
+            return None
+        return self._register_confirmation("dynamic_expert_no_plan_id", session_id, call_id, session)
+
+    def _register_confirmation(
+        self, identity_key: str, session_id: str, call_id: str, session: Any,
+    ) -> dict[str, str] | None:
+        """Register one server-owned identity without resetting its admission nonce."""
+        if self._closed or not session_id or not call_id:
             return None
         if self.session_id and self.session_id != session_id:
             return None
-        if self._confirmation and self._confirmation["tool_call_id"] != call_id:
+        if self._confirmation and (
+            self._confirmation["tool_call_id"] != call_id or identity_key not in self._confirmation
+        ):
             return None
         if not self._confirmation:
             self.session_id = session_id
             self._confirmation = {
-                "session_id": session_id, "tool_call_id": call_id,
-                "dynamic_expert_plan_id": uuid4().hex,
+                "session_id": session_id, "tool_call_id": call_id, identity_key: uuid4().hex,
             }
             if session is not None:
                 self._confirmation_session = session
@@ -424,6 +453,30 @@ class DynamicExpertRound:
             self._confirmation_nonce and nonce == self._confirmation_nonce
             and self.matches_confirmation(session_id, call_id, metadata)
         )
+
+    async def resolve_no_plan_choice(
+        self, session_id: str, call_id: str, metadata: dict[str, Any],
+        confirmation_nonce: str, decision: str,
+    ) -> dict[str, Any]:
+        """Consume the saved choice once, leaving a durable tool result."""
+        async with self._planning_lock:
+            if (decision not in {"continue", "summon"}
+                    or not self.matches_confirmation_resume(
+                        session_id, call_id, metadata, confirmation_nonce,
+                    )
+                    or self.pending_plan is not None
+                    or not self.response or self.response.get("status") != "no_plan"
+                    or not metadata.get("dynamic_expert_no_plan_id")):
+                return {"success": False, "status": "error", "reason": "expert_confirmation_expired"}
+            self.response = {
+                **self.response,
+                "decision": decision,
+                "confirmation_id": metadata["dynamic_expert_no_plan_id"],
+                "candidate_count": self.candidate_count,
+            }
+            self.clear_confirmation_state()
+            self._confirmation = {}
+            return self.response
 
     async def confirm_and_bind(
         self, session_id: str, call_id: str, metadata: dict[str, Any], *, confirmation_nonce: str,
@@ -608,6 +661,8 @@ class DynamicExpertRound:
             return "已切换到用户确认的专家。请以当前专家身份和已加载的工具、技能继续完成原任务。"
         if self.response is not None and self.response.get("status") == "handoff_failed":
             return "专家切换失败，本轮已停止。请提示用户重试，等待新的用户请求。"
+        if self.response is not None and self.response.get("decision") == "summon":
+            return "用户选择先去召唤专家，本轮已结束。等待新的用户请求。"
         if self.plan is None:
             if self.response is None:
                 return (
@@ -623,6 +678,11 @@ class DynamicExpertRound:
                     "引用或翻译文本、否定和假设仅被提及时，不构成调用意图。"
                     "仅在完整上下文仍无法区分当前任务协作与其他意图时才澄清。"
                     "未明确要求时，沿用常规处理流程。已召唤固定专家团时沿用当前团队流程。"
+                )
+            if self.response.get("status") == "no_plan":
+                return (
+                    "服务已向用户显示本次未生成专家方案的提示，不要重复提示或等待用户选择。"
+                    "请沿用常规处理流程继续完成用户任务，不要声称专家已执行。"
                 )
             if self.response.get("status") == "declined":
                 return "用户选择不使用专家。请由小艺Work独立完成原任务，本轮不要再次规划专家。"
@@ -727,7 +787,8 @@ class ExpertPlanTool(Tool):
                 "continue the original task directly with that expert's loaded tools and skills. "
                 "Multiple experts return a planned_graph and task_tool subagent_type names. "
                 "handoff_failed stops the turn and requires the user to retry. Returns no_plan if no usable "
-                "expert plan is available. On no_plan, continue the normal task workflow. "
+                "expert plan is available. On no_plan, follow the user's returned choice: "
+                "continue the normal task or end this turn to summon more experts. "
                 "Do not call for an already summoned fixed expert team."
             ),
             input_params={
@@ -744,7 +805,8 @@ class ExpertPlanTool(Tool):
         round_state = self._round_provider(session_id)
         if round_state is None or round_state.closed or _in_plan_mode(round_state.agent, session):
             return {"success": False, "status": "error", "reason": "expert_plan_unavailable"}
-        if round_state.session_id != session_id or round_state.pending_plan is not None:
+        if (round_state.session_id != session_id or round_state.pending_plan is not None
+                or "dynamic_expert_no_plan_id" in round_state._confirmation):
             return {"success": False, "status": "error", "reason": "expert_confirmation_required"}
         return round_state.response or {
             "success": False, "status": "error", "reason": "expert_confirmation_required",

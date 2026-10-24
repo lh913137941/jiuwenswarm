@@ -408,7 +408,7 @@ async def test_no_available_experts_skips_core_model_and_binding(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_one_available_expert_is_planned_by_core_and_bound(monkeypatch):
+async def test_one_available_expert_is_planned_by_core_and_handed_off(monkeypatch):
     expert = replace(_experts("a")["a"], source="cache", avatar="avatars/cache.png")
     model = SimpleNamespace(invoke=AsyncMock(return_value={"content": json.dumps({
         "status": "ready", "nodes": [{"id": "a", "task": "整理资料"}], "edges": [],
@@ -417,21 +417,28 @@ async def test_one_available_expert_is_planned_by_core_and_bound(monkeypatch):
     monkeypatch.setattr(expert_team, "scan_local_experts", AsyncMock(return_value={"a": expert}))
     monkeypatch.setattr(expert_team, "_subagent_config", lambda _agent, expert, _model: expert.id)
     monkeypatch.setattr(expert_team, "apply_extension_hot", bind)
-    round_state = expert_team.DynamicExpertRound(FakeAgent(), "整理资料", model, session_id="session-1")
+    handoff = AsyncMock(return_value=[])
+    round_state = expert_team.DynamicExpertRound(
+        FakeAgent(), "整理资料", model, session_id="session-1", handoff_expert=handoff,
+    )
     tool = expert_team.ExpertPlanTool(lambda _sid: round_state)
 
     await round_state.compose("整理资料")
     await _confirm_round(round_state)
     result = await tool.invoke({"query": "整理资料"}, session=_session())
 
-    assert result["success"] is True and result["status"] == "ready"
-    assert result["bindings"] == {"a": expert_team._subagent_type("a")}
-    assert result["planned_graph"]["graph"]["edges"] == []
-    assert result["expert_assets"] == {"a": {"source": "cache", "avatar": "avatars/cache.png"}}
-    assert bind.await_args.args[1].subagents == ["a"]
+    assert result == {
+        "success": True, "status": "handed_off",
+        "plan_id": round_state._confirmation["dynamic_expert_plan_id"],
+        "expert": {"id": "a", "name": "专家a", "source": "cache", "avatar": "avatars/cache.png"},
+    }
+    assert round_state.plan is None and round_state._bindings == {}
+    assert "task_tool" not in round_state.guidance()
+    assert "常规处理" not in round_state.guidance()
+    handoff.assert_awaited_once_with(round_state, expert)
     assert await tool.invoke({"query": "重复规划"}, session=_session()) == result
     model.invoke.assert_awaited_once()
-    bind.assert_awaited_once()
+    bind.assert_not_awaited()
 
 
 @pytest.mark.asyncio

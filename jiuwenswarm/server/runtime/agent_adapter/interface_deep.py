@@ -11202,6 +11202,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
                     dynamic_expert_round = DynamicExpertRound(
                         self._instance, query, resolved_model, session_id=session_id,
+                        handoff_expert=self._handoff_confirmed_expert,
                     )
                     self._dynamic_expert_rounds[session_id] = dynamic_expert_round
 

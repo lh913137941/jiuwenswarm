@@ -374,7 +374,7 @@ async def test_dynamic_confirmation_resumes_same_round_and_rejects_stale_answers
         fixture.ctx.extra[RESUME_USER_INPUT_KEY] = request.inputs["query"]
         await fixture.rail.before_tool_call(fixture.ctx)
         result = await fixture.tool.invoke({}, session=fixture.session)
-        assert result["status"] == "ready"
+        assert result["status"] == "handed_off"
         await leases.emit(SimpleNamespace(type="answer", payload={"output": "已完成"}))
         await leases.finish_current()
 
@@ -409,7 +409,8 @@ async def test_dynamic_confirmation_resumes_same_round_and_rejects_stale_answers
         assert repeated[-1].payload["code"] == "INTERRUPT_EXPIRED"
         assert len(sent) == 1
         fixture.scan.assert_awaited_once()
-        fixture.bind.assert_awaited_once()
+        fixture.handoff.assert_awaited_once()
+        fixture.bind.assert_not_awaited()
     finally:
         await leases.shutdown()
 
@@ -443,8 +444,9 @@ async def test_late_expert_answer_cannot_confirm_new_round_reusing_provider_call
     assert current.round.pending_plan is not None
     current.bind.assert_not_awaited()
     result = await apply_answers(current, answers)
-    assert result["status"] == "ready"
-    current.bind.assert_awaited_once()
+    assert result["status"] == "handed_off"
+    current.handoff.assert_awaited_once()
+    current.bind.assert_not_awaited()
     await current.round.close()
 
 

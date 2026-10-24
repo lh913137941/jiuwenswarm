@@ -148,6 +148,11 @@ class DynamicExpertConfirmationRail(ConfirmInterruptRail):
             result = await round_state.confirm_and_bind(
                 session_id, call_id, metadata, confirmation_nonce=nonce,
             )
+            if result.get("status") == "handoff_failed":
+                ctx.request_force_finish({
+                    "output": "这位专家暂时没能接手，这次任务没有继续执行。请再试一次。",
+                    "result_type": "answer",
+                })
             return self.approve() if result.get("success") else self.reject(tool_result=result)
 
         if action == "revise" and not payload.approved and payload.feedback.strip():

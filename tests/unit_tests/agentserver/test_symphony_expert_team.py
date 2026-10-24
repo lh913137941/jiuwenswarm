@@ -94,11 +94,40 @@ async def test_scan_experts_keeps_local_candidates_when_cache_directory_unreadab
     assert list(await expert_team.scan_local_experts()) == ["local-agent"]
 
 
+@pytest.mark.asyncio
+async def test_candidate_count_excludes_duplicates_groups_damaged_and_unloadable_experts(tmp_path, monkeypatch):
+    local_root, cache_root = tmp_path / "experts", tmp_path / "experts_cache"
+    _make_expert(local_root, "shared", "本地版本")
+    _make_expert(cache_root, "shared", "缓存版本")
+    _make_expert(cache_root, "cached", "缓存独立专家")
+    broken = _make_expert(local_root, "damaged", "损坏专家")
+    (broken / "manifest.json").write_text("{}", encoding="utf-8")
+    _make_expert(cache_root, "unloadable", "无法加载资源")
+    group = cache_root / "group"
+    group.mkdir()
+    (group / "manifest.json").write_text('{"package_type":"agent_group"}', encoding="utf-8")
+    monkeypatch.setattr(expert_team, "get_agent_experts_dir", lambda: local_root)
+    monkeypatch.setattr(expert_team, "get_expert_cache_dir", lambda: cache_root)
+    monkeypatch.setattr(expert_store, "get_expert_cache_dir", lambda: cache_root)
+    def config(_agent, expert, _model):
+        if expert.id == "unloadable":
+            raise ValueError("missing resource")
+        return expert.id
+    monkeypatch.setattr(expert_team, "_subagent_config", config)
+    planner = AsyncMock(return_value={"status": "no_plan"})
+    monkeypatch.setattr(expert_team, "plan_experts", planner)
+    round_state = expert_team.DynamicExpertRound(FakeAgent(), "用户任务", object())
+    await round_state.compose("用户任务")
+    assert round_state.candidate_count == 2
+    assert {candidate.id for candidate in planner.await_args.args[1]} == {"shared", "cached"}
+
+
 def test_expert_config_has_isolated_skill_rail_and_owner_without_parent_skill_tools(monkeypatch):
     parent_tool = SimpleNamespace(card=ToolCard(id="general_parent", name="general", description="通用工具"))
     scoped_names = [
         "skill_tool", "list_skill", "skill_index", "skill_index_build", "symphony_read_graph",
         "symphony_compose_graph", "symphony_plan_experts", "task_tool", "sessions_spawn",
+        "Agent", "task", "enter_plan_mode", "exit_plan_mode", "switch_mode",
     ]
     parent_tools = [parent_tool, *(ToolCard(name=name, description=name) for name in scoped_names)]
     parent_rail = SkillUseRail(skills_dir=[])
@@ -184,7 +213,7 @@ async def test_planning_omits_skill_names_but_preserves_executable_template(tmp_
     round_state = expert_team.DynamicExpertRound(FakeAgent(), "请专家写报告", model)
     result = await round_state.compose("请专家写报告")
 
-    assert result == {"success": True, "status": "no_plan"}
+    assert result == {"success": True, "status": "no_plan", "reason": "no_suitable_plan"}
     model.invoke.assert_awaited_once()
     payload = json.loads(model.invoke.await_args.kwargs["messages"][1]["content"])
     assert payload["experts"] == [{
@@ -230,8 +259,17 @@ async def _ready_round(monkeypatch, edges=(), expert_ids=("a", "b")):
     monkeypatch.setattr(expert_team, "plan_experts", core_plan)
     monkeypatch.setattr(expert_team, "_subagent_config", lambda _agent, expert, _model: expert.id)
     monkeypatch.setattr(expert_team, "apply_extension_hot", bind)
-    round_state = expert_team.DynamicExpertRound(agent, "用户任务", model)
+    round_state = expert_team.DynamicExpertRound(agent, "用户任务", model, session_id="session-1")
     return round_state, agent
+
+
+async def _confirm_round(round_state):
+    await round_state.compose("用户任务")
+    metadata = round_state.request_confirmation("session-1", "plan-call")
+    nonce = round_state.claim_confirmation_resume("session-1", "plan-call", metadata or {})
+    return await round_state.confirm_and_bind(
+        "session-1", "plan-call", metadata or {}, confirmation_nonce=nonce or "",
+    )
 
 
 @pytest.mark.asyncio
@@ -256,7 +294,7 @@ async def test_model_tool_menu_refreshes_only_plan_and_task_tool(monkeypatch):
     assert [tool.name for tool in ctx.inputs.tools] == [
         "read_file", "symphony_compose_graph", expert_team.PLAN_TOOL_NAME,
     ]
-    await round_state.compose("用户任务")
+    await _confirm_round(round_state)
     await rail.before_model_call(ctx)
     assert [tool.name for tool in ctx.inputs.tools] == ["read_file", "task_tool"]
 
@@ -271,7 +309,7 @@ async def test_model_tool_menu_refreshes_only_plan_and_task_tool(monkeypatch):
 @pytest.mark.asyncio
 async def test_independent_nodes_can_run_together_but_failure_blocks_successors(monkeypatch):
     round_state, agent = await _ready_round(monkeypatch)
-    await round_state.compose("用户任务")
+    await _confirm_round(round_state)
     rail = expert_team.DynamicExpertRail(lambda _sid: round_state)
     rail.init(agent)
     a = _tool_ctx(expert_team._subagent_type("a"), "call-a")
@@ -284,7 +322,7 @@ async def test_independent_nodes_can_run_together_but_failure_blocks_successors(
     assert round_state._states == {"a": "failed", "b": "completed"}
 
     dependent, _agent = await _ready_round(monkeypatch, [("a", "b")])
-    await dependent.compose("用户任务")
+    await _confirm_round(dependent)
     gate = expert_team.DynamicExpertRail(lambda _sid: dependent)
     gate.init(agent)
     failed_a = _tool_ctx(expert_team._subagent_type("a"), "failed-a")
@@ -298,7 +336,7 @@ async def test_independent_nodes_can_run_together_but_failure_blocks_successors(
 @pytest.mark.asyncio
 async def test_interrupted_expert_resumes_same_call_without_rewriting_interactive_input(monkeypatch):
     round_state, agent = await _ready_round(monkeypatch, [("a", "b")])
-    await round_state.compose("用户任务")
+    await _confirm_round(round_state)
     rail = expert_team.DynamicExpertRail(lambda _sid: round_state)
     rail.init(agent)
     call = _tool_ctx(expert_team._subagent_type("a"), "call-a")
@@ -365,12 +403,14 @@ async def test_no_available_experts_skips_core_model_and_binding(monkeypatch):
     monkeypatch.setattr(expert_team, "scan_local_experts", scan)
     monkeypatch.setattr(expert_team, "_subagent_config", lambda _agent, expert, _model: expert.id)
     round_state = expert_team.DynamicExpertRound(FakeAgent(), "普通任务", object())
-    assert await round_state.compose("普通任务") == {"success": True, "status": "no_plan"}
+    assert await round_state.compose("普通任务") == {
+        "success": True, "status": "no_plan", "reason": "no_available_experts",
+    }
     assert round_state.plan is None
 
 
 @pytest.mark.asyncio
-async def test_one_available_expert_is_planned_by_core_and_bound(monkeypatch):
+async def test_one_available_expert_is_planned_by_core_and_handed_off(monkeypatch):
     expert = replace(_experts("a")["a"], source="cache", avatar="avatars/cache.png")
     model = SimpleNamespace(invoke=AsyncMock(return_value={"content": json.dumps({
         "status": "ready", "nodes": [{"id": "a", "task": "整理资料"}], "edges": [],
@@ -379,19 +419,28 @@ async def test_one_available_expert_is_planned_by_core_and_bound(monkeypatch):
     monkeypatch.setattr(expert_team, "scan_local_experts", AsyncMock(return_value={"a": expert}))
     monkeypatch.setattr(expert_team, "_subagent_config", lambda _agent, expert, _model: expert.id)
     monkeypatch.setattr(expert_team, "apply_extension_hot", bind)
-    round_state = expert_team.DynamicExpertRound(FakeAgent(), "整理资料", model)
+    handoff = AsyncMock(return_value=[])
+    round_state = expert_team.DynamicExpertRound(
+        FakeAgent(), "整理资料", model, session_id="session-1", handoff_expert=handoff,
+    )
     tool = expert_team.ExpertPlanTool(lambda _sid: round_state)
 
+    await round_state.compose("整理资料")
+    await _confirm_round(round_state)
     result = await tool.invoke({"query": "整理资料"}, session=_session())
 
-    assert result["success"] is True and result["status"] == "ready"
-    assert result["bindings"] == {"a": expert_team._subagent_type("a")}
-    assert result["planned_graph"]["graph"]["edges"] == []
-    assert result["expert_assets"] == {"a": {"source": "cache", "avatar": "avatars/cache.png"}}
-    assert bind.await_args.args[1].subagents == ["a"]
+    assert result == {
+        "success": True, "status": "handed_off",
+        "plan_id": round_state._confirmation["dynamic_expert_plan_id"],
+        "expert": {"id": "a", "name": "专家a", "source": "cache", "avatar": "avatars/cache.png"},
+    }
+    assert round_state.plan is None and round_state._bindings == {}
+    assert "task_tool" not in round_state.guidance()
+    assert "常规处理" not in round_state.guidance()
+    handoff.assert_awaited_once_with(round_state, expert)
     assert await tool.invoke({"query": "重复规划"}, session=_session()) == result
     model.invoke.assert_awaited_once()
-    bind.assert_awaited_once()
+    bind.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -399,14 +448,14 @@ async def test_binding_failure_does_not_leave_a_plan(monkeypatch):
     round_state, _agent = await _ready_round(monkeypatch)
 
     monkeypatch.setattr(expert_team, "apply_extension_hot", AsyncMock(side_effect=RuntimeError("绑定失败")))
-    result = await round_state.compose("用户任务")
+    result = await _confirm_round(round_state)
     assert result["success"] is False and round_state.plan is None
 
 
 @pytest.mark.asyncio
 async def test_round_close_drains_only_owned_interrupted_children_and_skill_rails(monkeypatch):
     round_state, agent = await _ready_round(monkeypatch)
-    await round_state.compose("用户任务")
+    await _confirm_round(round_state)
     owned = SimpleNamespace(card=SimpleNamespace(id="this-round"), cleanup_task_resources=AsyncMock())
     other = SimpleNamespace(card=SimpleNamespace(id="other-round"), cleanup_task_resources=AsyncMock())
     pending = {"ours": (owned, False), "theirs": (other, False)}
@@ -431,7 +480,8 @@ async def test_round_close_drains_only_owned_interrupted_children_and_skill_rail
 
 
 @pytest.mark.asyncio
-async def test_cancellation_while_binding_unbinds_completed_batch(monkeypatch):
+@pytest.mark.parametrize("binding_fails", [False, True])
+async def test_cancellation_while_binding_preserves_cancel_and_cleans_completed_batch(monkeypatch, binding_fails):
     round_state, _agent = await _ready_round(monkeypatch)
     started = asyncio.Event()
     release = asyncio.Event()
@@ -440,6 +490,8 @@ async def test_cancellation_while_binding_unbinds_completed_batch(monkeypatch):
     async def bind(_agent, _parts):
         started.set()
         await release.wait()
+        if binding_fails:
+            raise RuntimeError("binding failed after cancellation")
         return ["bound"]
 
     async def unbind(_agent, refs):
@@ -447,20 +499,20 @@ async def test_cancellation_while_binding_unbinds_completed_batch(monkeypatch):
 
     monkeypatch.setattr(expert_team, "apply_extension_hot", bind)
     monkeypatch.setattr(expert_team, "unapply_extension_hot", unbind)
-    planning = asyncio.create_task(round_state.compose("用户任务"))
+    planning = asyncio.create_task(_confirm_round(round_state))
     await started.wait()
     planning.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):
         await planning
     await round_state.close()
-    assert unbound == ["bound"]
+    assert unbound == ([] if binding_fails else ["bound"])
 
 
 @pytest.mark.asyncio
 async def test_dependency_order_result_passing_and_duplicate_guard(monkeypatch):
     round_state, agent = await _ready_round(monkeypatch, [("a", "b")])
-    await round_state.compose("用户任务")
+    await _confirm_round(round_state)
     rail = expert_team.DynamicExpertRail(lambda _sid: round_state)
     rail.init(agent)
 
@@ -485,3 +537,40 @@ async def test_dependency_order_result_passing_and_duplicate_guard(monkeypatch):
         await rail.before_tool_call(rejected)
         assert rejected.extra["_skip_tool"]
         assert ("不可重复" if call_id else "工具调用 ID") in rejected.inputs.tool_msg.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("tool_name", ["Agent", "sessions_spawn", "symphony_compose_graph", "task_tool"])
+async def test_dynamic_plan_blocks_competing_delegation(monkeypatch, confirmed, tool_name):
+    round_state, agent = await _ready_round(monkeypatch)
+    if confirmed:
+        await _confirm_round(round_state)
+    else:
+        await round_state.compose("用户任务")
+    rail = expert_team.DynamicExpertRail(lambda _: round_state)
+    rail.init(agent)
+    ctx = _tool_ctx("general-purpose", "competing-call")
+    ctx.inputs.tool_name = tool_name
+    await rail.before_tool_call(ctx)
+    assert ctx.extra["_skip_tool"]
+    assert not round_state._inflight
+    menu = SimpleNamespace(session=_session(), inputs=ModelCallInputs(tools=[
+        SimpleNamespace(name="Agent"), SimpleNamespace(name="read_file"),
+    ]))
+    await rail.before_model_call(menu)
+    assert "Agent" not in {tool.name for tool in menu.inputs.tools}
+    assert "read_file" in {tool.name for tool in menu.inputs.tools}
+
+
+@pytest.mark.asyncio
+async def test_dynamic_tasks_remain_blocked_when_session_reenters_plan_mode(monkeypatch):
+    round_state, agent = await _ready_round(monkeypatch)
+    await _confirm_round(round_state)
+    agent.load_state = lambda _: SimpleNamespace(plan_mode=SimpleNamespace(mode="plan"))
+    rail = expert_team.DynamicExpertRail(lambda _: round_state)
+    rail.init(agent)
+    ctx = _tool_ctx(expert_team._subagent_type("a"), "forged-plan-task")
+    await rail.before_tool_call(ctx)
+    assert ctx.extra["_skip_tool"] and "只读规划模式" in ctx.inputs.tool_msg.content
+    assert not round_state._inflight

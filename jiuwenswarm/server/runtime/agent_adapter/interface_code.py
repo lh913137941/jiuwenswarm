@@ -490,6 +490,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
 
         self._instance_overrides = dict(config or {}) if isinstance(config, dict) else {}
         config_base = get_config()
+        self._initialize_dynamic_experts(config_base)
         self._refresh_multimodal_configs(config_base)
         config = config_base.get('react', {}).copy()
         self._config_cache = config.copy()
@@ -524,7 +525,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
         # 权限护栏由 openjiuwen PermissionInterruptRail + ToolPermissionHost 接管；
         # 无需初始化 jiuwenswarm 内置 PermissionEngine（已弃用）。
 
-        rails_list = self._build_agent_rails(config, config_base, mode="code")
+        rails_list = self._build_agent_rails(config, config_base, mode=mode)
 
         sys_operation = self._create_sys_operation()
         if sys_operation is None:
@@ -671,6 +672,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
                 self._build_xiaoyi_default_tool_visibility_rail,
             ),
             _RailBuildInfo("_cspl_sentinel_rail", self._build_cspl_sentinel_rail),
+            *self._dynamic_expert_rail_infos(mode),
             _RailBuildInfo("_project_memory_rail", self._build_project_memory_rail),
             _RailBuildInfo(
                 "_permission_rail",
@@ -1320,7 +1322,7 @@ class JiuwenSwarmCodeAdapter(JiuWenSwarmDeepAdapter):
     # ─── Tools 构建 ──────────────────────────
 
     async def _get_tool_cards(self, agent_id: str) -> list[Any]:
-        return self.build_code_tool_cards(agent_id)
+        return [*self.build_code_tool_cards(agent_id), *self._register_dynamic_expert_tools(agent_id)]
 
     def build_code_tool_cards(self, agent_id: str) -> list[Any]:
         """Get tool cards for code mode — from config.yaml::modes.code.tools.

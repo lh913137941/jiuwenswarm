@@ -534,7 +534,10 @@ def build_permission_rail(
             # forever. Bypass the permission rail for ask_user so the ask_user
             # rail's answer reaches the model. The digital-avatar scene below
             # intentionally blocks interactive tools, so exclude it here.
-            if inp.normalized_tool_name == "ask_user" and (
+            # Expert planning also owns its confirmation: it only prepares a
+            # plan before approval. Generic grants must not consume that answer;
+            # subsequent task_tool operations keep their normal permission checks.
+            if inp.normalized_tool_name in {"ask_user", "symphony_plan_experts"} and (
                 perm_ctx is None
                 or getattr(perm_ctx, "scene", None) != "group_digital_avatar"
             ):
@@ -743,7 +746,7 @@ _PERMISSION_INTERRUPT_MARKERS = (
     "安全风险评估",
 )
 # exit_plan_mode uses PlanApprovalInterruptRail (extends ConfirmInterruptRail)
-_CONFIRM_INTERRUPT_TOOLS = frozenset({"switch_mode", "exit_plan_mode"})  
+_CONFIRM_INTERRUPT_TOOLS = frozenset({"switch_mode", "exit_plan_mode", "symphony_plan_experts"})
 
 
 def _read_interrupt_fields(value_obj: Any) -> tuple[str, str, dict | None]:
@@ -798,6 +801,8 @@ def _parse_plan_metadata_from_message(message: str) -> tuple[str, str]:
 
 
 def _resolve_interrupt_source(tool_name: str, message: str) -> str:
+    if tool_name == "symphony_plan_experts":
+        return "confirm_interrupt"
     if _is_permission_interrupt_message(message, tool_name):
         return "permission_interrupt"
     return "confirm_interrupt"
@@ -913,6 +918,15 @@ def convert_interactions_to_ask_user_questions(state_outputs: list) -> list[dict
 
         tool_name, message, _tool_args = _read_interrupt_fields(value_obj)
         source = _resolve_interrupt_source(tool_name, message)
+        if tool_name == "symphony_plan_experts":
+            from jiuwenswarm.symphony.expert_confirmation import confirmation_request_id
+
+            metadata = _extract_interrupt_metadata(value_obj)
+            request_id = confirmation_request_id(metadata) or request_id
+            if source == "confirm_interrupt" and isinstance(metadata.get("expert_plan"), dict):
+                question_data["expert_plan"] = metadata["expert_plan"]
+            if source == "confirm_interrupt" and isinstance(metadata.get("expert_no_plan"), dict):
+                question_data["expert_no_plan"] = metadata["expert_no_plan"]
 
         payload = {
             "event_type": "chat.ask_user_question",
@@ -1050,6 +1064,8 @@ def _build_multi_questions(questions_data: list) -> list:
             "skill_name",
             "skillName",
             "authorization_scopes",
+            "expert_plan",
+            "expert_no_plan",
         ):
             if key in q and q[key] is not None:
                 question_payload[key] = q[key]

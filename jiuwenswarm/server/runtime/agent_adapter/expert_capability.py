@@ -69,6 +69,78 @@ class ExpertCapabilityMixin:
             lock = self.__expert_apply_lock_value = asyncio.Lock()
             return lock
 
+    async def _handoff_confirmed_expert(self, round_state: Any, expert: Any) -> list[str]:
+        """仅供已消费确认凭据的暂停回合调用；外部 expert.load 仍走 BUSY 守卫。"""
+        from jiuwenswarm.server.runtime.session.session_metadata import update_session_metadata
+
+        session_id = round_state.session_id
+        if (
+            not self._is_session_scoped_adapter
+            or self._parent_session_id != session_id
+            or self._instance is not round_state.agent
+            or getattr(self, "_dynamic_expert_rounds", {}).get(session_id) is not round_state
+            or not round_state._confirmation_submitted
+            or round_state._confirmation_nonce
+            or round_state.pending_plan is None
+            or list(round_state.pending_plan["nodes"]) != [expert.id]
+            or round_state._selected_experts.get(expert.id) is not expert
+            or expert.package_dir is None
+        ):
+            raise RuntimeError("expert_confirmation_expired")
+
+        # Shield the load itself: Core can be interrupted between registering
+        # extension resources and returning its LoadRecord. Always collect that
+        # record before rolling back, even when the user stops this turn.
+        original_tools = {tool.name for tool in await self._instance.ability_manager.list_tool_info()}
+        load_task = asyncio.create_task(self._apply_expert(expert.id, package_dir=expert.package_dir))
+        failure_reason = "expert_load_failed"
+        try:
+            await asyncio.shield(load_task)
+            failure_reason = "expert_tools_refresh_failed"
+            added_tools = sorted(
+                tool.name for tool in await self._instance.ability_manager.list_tool_info()
+                if tool.name not in original_tools
+            )
+            failure_reason = "expert_metadata_write_failed"
+            update_session_metadata(
+                session_id=session_id, expert_id=expert.id, expert_type="agent", sync=True,
+            )
+            return added_tools
+        except (Exception, asyncio.CancelledError) as exc:
+            async def rollback() -> None:
+                try:
+                    await load_task
+                except (Exception, asyncio.CancelledError):
+                    pass
+                try:
+                    await self._apply_expert(None)
+                finally:
+                    # A failed synchronous write may already have changed the
+                    # metadata cache. Clear both the durable and cached binding.
+                    self._expert_reuse_reconciled = True
+                    update_session_metadata(
+                        session_id=session_id, expert_id="", expert_type="agent", sync=True,
+                    )
+
+            cleanup_task = asyncio.create_task(rollback())
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                cleanup_task.result()
+            except Exception as cleanup_error:
+                logger.exception("[session_id=%s] expert handoff rollback failed", session_id)
+                if not isinstance(exc, asyncio.CancelledError):
+                    raise RuntimeError("expert_handoff_rollback_failed") from cleanup_error
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            logger.warning("[session_id=%s] expert handoff failed: %s", session_id, exc)
+            raise RuntimeError(failure_reason) from exc
+
     async def _apply_expert(
             self,
             expert_id: str | None,

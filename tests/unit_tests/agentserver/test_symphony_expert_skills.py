@@ -220,6 +220,150 @@ class InterruptSkillOnce(AgentRail):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("choice", "answer_other_first"), [
+    ("confirm", False), ("cancel", False), ("feedback", False), ("skip", False), ("confirm", True),
+])
+async def test_real_deep_agent_confirms_then_runs_task_and_summarizes_same_plan(
+    tmp_path, monkeypatch, choice, answer_other_first,
+):
+    from openjiuwen.harness.rails.interrupt.ask_user_rail import AskUserRail
+    from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
+        build_permission_rail, convert_interactions_to_ask_user_questions,
+    )
+    from jiuwenswarm.server.runtime.agent_adapter.interface import JiuWenSwarm
+    from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
+    from jiuwenswarm.symphony.expert_confirmation import DynamicExpertConfirmationRail, confirmation_request_id
+
+    parent = await _parent(tmp_path)
+    permission_config = {
+        "enabled": True, "permission_mode": "strict",
+        "tools": {expert_team.PLAN_TOOL_NAME: "ask", "task_tool": "allow"},
+    }
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist."
+        "get_permissions_with_session_overlay", lambda **_: copy.deepcopy(permission_config),
+    )
+    permission_rail = build_permission_rail({"permissions": permission_config})
+    assert permission_rail is not None
+    expert = _package(tmp_path / "experts_cache", "researcher", "确认后执行的真实技能正文")
+    model = parent.deep_config.model
+    plan_call = _call(expert_team.PLAN_TOOL_NAME, query="请专家整理资料")
+    if answer_other_first:
+        other_call = _call("ask_user", questions=[{"question": "资料范围", "header": "范围"}]).tool_calls[0]
+        plan_call.tool_calls.append(other_call)
+    task_call = _call("task_tool", subagent_type=expert_team._subagent_type(expert.id),
+                      task_description="整理资料")
+    display_summary = "归纳资料中的关键事实和依据，形成便于主理人复核与汇总的清晰结论。"
+    revised_summary = "根据补充条件重新梳理资料范围，提炼关键事实和可执行的后续建议。"
+    planned = AssistantMessage(content=json.dumps({
+        "status": "ready", "nodes": [{"id": expert.id, "task": "整理资料", "summary": display_summary}],
+        "edges": [],
+    }))
+    model.responses.extend([plan_call, planned])
+    if choice == "confirm":
+        model.responses.extend([
+            task_call,
+            _call("skill_tool", skill_name="private"),
+            AssistantMessage(content="专家整理完成：已读技能资料"),
+            AssistantMessage(content="小艺Work汇总：专家已整理资料"),
+        ])
+    elif choice == "feedback":
+        model.responses.append(AssistantMessage(content=json.dumps({
+            "status": "ready",
+            "nodes": [{"id": expert.id, "task": "整理资料", "summary": revised_summary}],
+            "edges": [],
+        })))
+    else:
+        model.responses.append(AssistantMessage(content="小艺Work独立完成：资料已整理"))
+    scan = AsyncMock(return_value={expert.id: expert})
+    monkeypatch.setattr(expert_team, "scan_local_experts", scan)
+    spec, _skill_rail = _production_spec(parent, expert, model)
+    monkeypatch.setattr(expert_team, "_subagent_config", lambda *_: spec)
+    session = Session(session_id="confirmed-real-task")
+    round_state = expert_team.DynamicExpertRound(parent, "请专家整理资料", model,
+                                                session_id=session.get_session_id())
+    def provider(sid):
+        return round_state if sid == session.get_session_id() else None
+    await apply_extension_hot(parent, ExtensionParts(
+        tools=[expert_team.ExpertPlanTool(provider)],
+        rails=[permission_rail, expert_team.DynamicExpertRail(provider), DynamicExpertConfirmationRail(provider)]
+              + ([AskUserRail()] if answer_other_first else []),
+    ))
+    try:
+        interrupted = await asyncio.wait_for(parent.invoke({"query": "请专家整理资料"}, session=session), 10)
+        assert interrupted["result_type"] == "interrupt"
+        assert set(interrupted["interrupt_ids"]) == {call.id for call in plan_call.tool_calls}
+        assert round_state.plan is None and round_state.pending_plan is not None
+        assert round_state._refs == [] and len(model.calls) == 2
+        assert round_state.confirmation_display(round_state._confirmation["dynamic_expert_plan_id"])[
+            "members"
+        ][0]["summary"] == expert.description
+        graph = round_state.pending_plan
+        if answer_other_first:
+            metadata = dict(round_state._confirmation)
+            cards = convert_interactions_to_ask_user_questions([item.payload for item in interrupted["state"]])
+            plan_card = next(card for card in cards if card["source"] == "confirm_interrupt")
+            other_answer = JiuWenSwarm._build_interactive_input_from_answers(
+                other_call.id, [{"question": "资料范围", "custom_input": "国内"}], source="ask_user_interrupt",
+            )
+            waiting = await asyncio.wait_for(parent.invoke({"query": other_answer}, session=session), 10)
+            assert waiting["result_type"] == "interrupt"
+            assert waiting["interrupt_ids"] == [plan_call.tool_calls[0].id]
+            assert convert_interactions_to_ask_user_questions([item.payload for item in waiting["state"]]) == [plan_card]
+            assert round_state.pending_plan is graph and round_state._confirmation == metadata
+            assert not round_state.closed and round_state._refs == [] and len(model.calls) == 2
+            scan.assert_awaited_once()
+        answers = {
+            "confirm": [{"selected_options": ["召唤专家处理"]}],
+            "cancel": [{"selected_options": ["不用专家，由小艺Work继续"]}],
+            "feedback": [{"selected_options": [], "custom_input": "请调整分工"}],
+            "skip": [],
+        }[choice]
+        request_id = confirmation_request_id(round_state._confirmation)
+        inputs = {"query": JiuWenSwarm._build_interactive_input_from_answers(
+            request_id, answers, source="confirm_interrupt",
+        )}
+        adapter = object.__new__(JiuWenSwarmDeepAdapter)
+        adapter._instance = SimpleNamespace(_loop_session=session)
+        adapter._dynamic_expert_rounds = {session.get_session_id(): round_state}
+        assert adapter._prepare_confirmation_resume(session.get_session_id(), {"request_id": request_id}, inputs)
+        assert set(inputs["query"].user_inputs) == {plan_call.tool_calls[0].id}
+        result = await asyncio.wait_for(parent.invoke(inputs, session=session), 10)
+        if choice == "feedback":
+            assert result["result_type"] == "interrupt"
+            assert round_state.pending_plan is not None and round_state.plan is None
+            assert round_state._confirmation["dynamic_expert_plan_id"] != request_id.removeprefix("symphony-plan:")
+            assert round_state.feedback == "请调整分工"
+            assert not round_state.closed and round_state._refs == []
+            assert len(model.calls) == 3
+            assert round_state.confirmation_display(
+                round_state._confirmation["dynamic_expert_plan_id"],
+            )["members"][0]["summary"] == expert.description
+            assert scan.await_count == 2
+            assert not parent.deep_config.subagents
+            return
+        if choice in ("cancel", "skip"):
+            assert round_state.closed and round_state.plan is None and round_state._refs == []
+            assert round_state.response["status"] == "declined"
+            assert result["output"] == "小艺Work独立完成：资料已整理"
+            assert len(model.calls) == 3
+            assert not parent.deep_config.subagents
+            return
+        assert result["output"] == "小艺Work汇总：专家已整理资料"
+        assert round_state.plan is graph
+        assert round_state._completed == {"researcher": "专家整理完成：已读技能资料"}
+        assert "确认后执行的真实技能正文" in "\n".join(_tool_messages(model))
+        assert "专家整理完成：已读技能资料" in "\n".join(_tool_messages(model))
+        assert isinstance(Runner.resource_mgr.get_tool(parent.ability_manager.get("task_tool").id), TaskTool)
+        scan.assert_awaited_once()
+        assert len(model.calls) == 6
+        assert display_summary not in str(model.calls[2:])
+    finally:
+        await round_state.close()
+    assert not parent.deep_config.subagents
+
+
+@pytest.mark.asyncio
 async def test_real_task_uses_own_and_public_skills_without_disabled_siblings(tmp_path):
     public_root = tmp_path / "public"
     _skill(public_root, "same", "公共同名正文")

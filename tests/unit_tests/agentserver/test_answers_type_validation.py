@@ -154,3 +154,16 @@ async def test_process_message_stream_returns_failed_chunk_for_invalid_answers(
     assert payload["event_type"] == "chat.error"
     assert payload["code"] == "INVALID_ARGUMENT"
     assert "must be a list" in payload["error"]
+
+
+def test_empty_no_plan_confirmation_answers_remain_an_invalid_expert_choice(monkeypatch):
+    from jiuwenswarm.symphony.expert_team import EXPERT_PLAN_ACTION_KEY
+
+    swarm = _make_swarm(monkeypatch)
+    request_id = "symphony-no-plan:displayed-choice"
+    inputs, _, _ = swarm._build_inputs(_make_request({
+        "query": "", "request_id": request_id, "source": "confirm_interrupt", "answers": [],
+    }))
+    assert inputs["query"].user_inputs[request_id] == {
+        "approved": False, "auto_confirm": False, "feedback": "", EXPERT_PLAN_ACTION_KEY: "invalid",
+    }

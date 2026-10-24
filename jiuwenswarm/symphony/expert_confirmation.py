@@ -1,4 +1,4 @@
-"""Explicit, task-scoped confirmation for a prepared dynamic expert plan."""
+"""Explicit, task-scoped confirmation for dynamic expert plans and no-plan choices."""
 
 from __future__ import annotations
 
@@ -18,12 +18,18 @@ from jiuwenswarm.symphony.expert_team import (
 )
 
 _PLAN_REQUEST_PREFIX = "symphony-plan:"
+_NO_PLAN_REQUEST_PREFIX = "symphony-no-plan:"
+_NO_PLAN_TITLE = "这次没找到合适的专家"
+_NO_PLAN_MESSAGE = "当前可用的专家还不多，去「专家·专家团」召唤更多专家吧。"
 
 
 def confirmation_request_id(metadata: dict[str, Any]) -> str:
     """A provider may reuse call IDs; each displayed plan needs its own answer ID."""
     plan_id = metadata.get("dynamic_expert_plan_id")
-    return f"{_PLAN_REQUEST_PREFIX}{plan_id}" if isinstance(plan_id, str) and plan_id else ""
+    if isinstance(plan_id, str) and plan_id:
+        return f"{_PLAN_REQUEST_PREFIX}{plan_id}"
+    no_plan_id = metadata.get("dynamic_expert_no_plan_id")
+    return f"{_NO_PLAN_REQUEST_PREFIX}{no_plan_id}" if isinstance(no_plan_id, str) and no_plan_id else ""
 
 
 def pending_confirmation(session: Any, request_id: str) -> tuple[str, str, dict[str, Any]] | None:
@@ -88,6 +94,28 @@ class DynamicExpertConfirmationRail(ConfirmInterruptRail):
             ],
         ))
 
+    def _interrupt_no_plan(
+        self, round_state: DynamicExpertRound, metadata: dict[str, str],
+    ) -> InterruptDecision:
+        display = {"title": _NO_PLAN_TITLE, "description": _NO_PLAN_MESSAGE}
+        return self.interrupt(InterruptRequest(
+            message=f"{display['title']}\n{display['description']}",
+            payload_schema=self.request.payload_schema,
+            auto_confirm_key="",
+            metadata={
+                "source": "confirm_interrupt", **metadata,
+                "expert_no_plan": {
+                    "confirmation_id": metadata["dynamic_expert_no_plan_id"],
+                    "candidate_count": round_state.candidate_count,
+                    "display": display,
+                },
+            },
+            ui_options=[
+                {"label": "小艺Work继续", "value": "continue"},
+                {"label": "去召唤专家", "value": "summon"},
+            ],
+        ))
+
     async def resolve_interrupt(
         self, ctx: AgentCallbackContext, tool_call: ToolCall | None,
         user_input: Any, auto_confirm_config: dict | None = None,
@@ -113,9 +141,12 @@ class DynamicExpertConfirmationRail(ConfirmInterruptRail):
                     if isinstance(resume_input, InteractiveInput) and resume_input.raw_inputs is None else {}
                 )
                 if (not other_answers or call_id in other_answers
-                        or any(key.startswith(_PLAN_REQUEST_PREFIX) for key in other_answers)):
+                        or any(key.startswith((_PLAN_REQUEST_PREFIX, _NO_PLAN_REQUEST_PREFIX))
+                               for key in other_answers)):
                     return self._expired(ctx)
-                if (round_state.pending_plan is None or not isinstance(metadata, dict)
+                if (not isinstance(metadata, dict)
+                        or not (round_state.pending_plan is not None
+                                or (round_state.response or {}).get("status") == "no_plan")
                         or not round_state.matches_confirmation(session_id, call_id, metadata)):
                     return self._expired(ctx)
             else:
@@ -123,10 +154,19 @@ class DynamicExpertConfirmationRail(ConfirmInterruptRail):
                 query = args.get("query")
                 await round_state.compose(query if isinstance(query, str) else "")
                 if round_state.pending_plan is None:
-                    return self.approve()
-                metadata = round_state.request_confirmation(session_id, call_id, session=ctx.session)
+                    if ((round_state.response or {}).get("status") != "no_plan"
+                            or (round_state.response or {}).get("decision") is not None
+                            or not round_state.supports_user_interaction):
+                        return self.approve()
+                    metadata = round_state.request_no_plan_confirmation(
+                        session_id, call_id, session=ctx.session,
+                    )
+                else:
+                    metadata = round_state.request_confirmation(session_id, call_id, session=ctx.session)
             if metadata is None:
                 return self._expired(ctx)
+            if "dynamic_expert_no_plan_id" in metadata:
+                return self._interrupt_no_plan(round_state, metadata)
             return self._interrupt_plan(round_state, metadata)
 
         # ReAct clears INTERRUPTION_KEY before invoking resumed tools. Keep
@@ -143,6 +183,21 @@ class DynamicExpertConfirmationRail(ConfirmInterruptRail):
         except (TypeError, ValueError):
             payload = ConfirmPayload(approved=False, feedback=str(user_input or ""))
         action = user_input.get(EXPERT_PLAN_ACTION_KEY) if isinstance(user_input, dict) else None
+        if "dynamic_expert_no_plan_id" in metadata:
+            if (action not in {"continue", "summon"} or not payload.approved
+                    or payload.auto_confirm or payload.persist_allow):
+                return self._expired(ctx)
+            result = await round_state.resolve_no_plan_choice(
+                session_id, call_id, metadata, nonce, action,
+            )
+            if not result.get("success"):
+                return self._expired(ctx)
+            if action == "summon":
+                ctx.request_force_finish({
+                    "output": "这次先停在这里。召唤更多专家后，你可以发起新任务。",
+                    "result_type": "answer",
+                })
+            return self.reject(tool_result=result)
         # Session/permanent permission grants are not an approval of this plan.
         if action == "approve" and payload.approved and not payload.auto_confirm and not payload.persist_allow:
             result = await round_state.confirm_and_bind(
@@ -163,6 +218,12 @@ class DynamicExpertConfirmationRail(ConfirmInterruptRail):
                 revised = round_state.request_confirmation(session_id, call_id, session=ctx.session)
                 if revised is not None:
                     return self._interrupt_plan(round_state, revised)
+            if result.get("status") == "no_plan":
+                revised = round_state.request_no_plan_confirmation(
+                    session_id, call_id, session=ctx.session,
+                )
+                if revised is not None:
+                    return self._interrupt_no_plan(round_state, revised)
             return self.reject(tool_result=result)
 
         if action == "decline" and not payload.approved:

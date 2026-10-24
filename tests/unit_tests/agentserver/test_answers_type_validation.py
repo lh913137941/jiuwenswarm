@@ -71,6 +71,56 @@ def test_build_inputs_accepts_valid_answers(
     assert "query" in inputs
 
 
+def test_empty_expert_confirmation_answers_build_a_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
+    from jiuwenswarm.symphony.expert_team import EXPERT_PLAN_ACTION_KEY
+
+    swarm = _make_swarm(monkeypatch)
+    request_id = "symphony-plan:displayed-plan"
+    inputs, _, _ = swarm._build_inputs(_make_request({
+        "query": "", "request_id": request_id, "source": "confirm_interrupt", "answers": [],
+    }))
+    assert inputs["query"].user_inputs[request_id] == {
+        "approved": False, "auto_confirm": False, "feedback": "", EXPERT_PLAN_ACTION_KEY: "decline",
+    }
+
+
+@pytest.mark.parametrize("source, request_id", [
+    ("confirm_interrupt", "ordinary-call"),
+    ("confirm_interrupt", "symphony-unrelated:call"),
+    ("permission_interrupt", "ordinary-call"),
+    ("permission_interrupt", "symphony-plan:displayed-plan"),
+    ("ask_user_interrupt", "ordinary-call"),
+])
+def test_empty_nonexpert_answers_keep_normal_prompt_path(monkeypatch, source, request_id):
+    swarm = _make_swarm(monkeypatch)
+    inputs, _, _ = swarm._build_inputs(_make_request({
+        "query": "hello", "request_id": request_id, "source": source, "answers": [],
+    }))
+    assert inputs["query"] == "stub-prompt"
+
+
+@pytest.mark.parametrize("source", ["confirm_interrupt", "permission_interrupt"])
+@pytest.mark.parametrize("value, custom_input, approved, feedback", [
+    ("本次允许", "", True, ""),
+    ("确认并开始", "", False, "未知选项: 确认并开始"),
+    ("取消", "", False, "未知选项: 取消"),
+    ("跳过", "", False, "未知选项: 跳过"),
+    ("", "", False, "未知选项: "),
+    ("取消", "保留这条反馈", False, "保留这条反馈"),
+    ("拒绝", "", False, "用户拒绝"),
+])
+def test_nonexpert_confirmation_and_permission_keep_upstream_answer_semantics(
+    source, value, custom_input, approved, feedback,
+):
+    answer = interface_module.JiuWenSwarm._build_interactive_input_from_answers(
+        "ordinary-call", [{"selected_options": [value] if value else [], "custom_input": custom_input}],
+        source=source,
+    )
+    assert answer.user_inputs["ordinary-call"] == {
+        "approved": approved, "auto_confirm": False, "feedback": feedback,
+    }
+
+
 @pytest.mark.asyncio
 async def test_process_message_stream_returns_failed_chunk_for_invalid_answers(
     monkeypatch: pytest.MonkeyPatch,

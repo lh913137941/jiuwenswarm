@@ -1287,7 +1287,12 @@ class JiuWenSwarm:
                 raise _InvalidAnswersTypeError(
                     f"answers must be a list, got {type(answers).__name__}"
                 )
-            if answers:
+            empty_expert_answer = (
+                answers == [] and params.get("source") == "confirm_interrupt"
+                and isinstance(params.get("request_id"), str)
+                and params["request_id"].startswith("symphony-plan:")
+            )
+            if answers or empty_expert_answer:
                 request_id = params.get("request_id", "")
                 source = params.get("source", "")
                 raw_original_request = params.get("original_request") if source == "ask_user_interrupt" else ""
@@ -1636,6 +1641,38 @@ class JiuWenSwarm:
         custom_input = answer.get("custom_input", "") if isinstance(answer, dict) else ""
 
         value = selected_options[0] if selected_options else ""
+
+        if source == "confirm_interrupt" and request_id.startswith("symphony-plan:"):
+            from jiuwenswarm.symphony.expert_team import EXPERT_PLAN_ACTION_KEY
+
+            expert_feedback = custom_input.strip() if isinstance(custom_input, str) else ""
+            approve_options = (
+                "approve", "交给这位专家", "请他们一起做", "确认并切换专家",
+                "召唤专家处理", "交给专家处理", "开始专家协作", "确认并开始",
+            )
+            decline_options = (
+                "decline", "还是小艺Work来做", "不用专家，由小艺Work继续", "不用专家，继续", "取消", "跳过",
+            )
+            if value in decline_options or (not value and not expert_feedback):
+                action = "decline"
+                confirm_payload = {"approved": False, "feedback": ""}
+            elif expert_feedback and value in ("", *approve_options):
+                action = "revise"
+                confirm_payload = {"approved": False, "feedback": expert_feedback}
+            elif value in approve_options:
+                action = "approve"
+                confirm_payload = {"approved": True, "feedback": ""}
+            else:
+                action = "invalid"
+                confirm_payload = {"approved": False, "feedback": ""}
+            interactive_input.update(request_id, {
+                **confirm_payload, "auto_confirm": False, EXPERT_PLAN_ACTION_KEY: action,
+            })
+            logger.info(
+                "[JiuWenSwarm] expert confirmation answer: request_id=%s action=%s",
+                request_id, action,
+            )
+            return interactive_input
 
         if value in ("approve", "本次允许", "Approve", "Proceed", "批准", "开始执行"):
             confirm_payload = {"approved": True, "auto_confirm": False, "feedback": ""}

@@ -99,7 +99,7 @@ async def test_dead_owned_service_port_change_can_rebuild_after_failed_delete(mo
     monkeypatch.setattr(Runner, "resource_mgr", SimpleNamespace(
         _resource_registry=SimpleNamespace(sys_operation=lambda: registry),
     ))
-    monkeypatch.setattr(SandboxGateway, "get_instance", lambda: SimpleNamespace(release_sandbox=AsyncMock()))
+    monkeypatch.setattr(SandboxGateway, "_instance", SandboxGateway())
     runner = JiuwenBoxRunner()
     runner.process = SimpleNamespace(returncode=1)
     runner.owns_process = True

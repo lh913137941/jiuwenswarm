@@ -3,10 +3,12 @@
 """New and cached session runtimes must match the sandbox switch."""
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from openjiuwen.core.sys_operation import OperationMode, SandboxGatewayConfig, SysOperation, SysOperationCard
 from openjiuwen.core.sys_operation.config import ContainerScope, PreDeployLauncherConfig, SandboxIsolationConfig
@@ -346,3 +348,105 @@ async def test_new_session_validates_executor_in_both_directions(session_runtime
     child.cleanup.assert_awaited_once()
     child.start_interaction.assert_not_awaited()
     assert sid not in root._session_adapters
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adapter_type", [JiuWenSwarmDeepAdapter, JiuwenSwarmCodeAdapter])
+@pytest.mark.parametrize("entry", ["rpc", "cli"])
+@pytest.mark.parametrize("owned", [False, True])
+async def test_disable_enable_same_session_uses_new_gateway_and_policy(
+    session_runtime, monkeypatch, adapter_type, entry, owned,
+):
+    """Keep real session switching, resource registry, Gateway and HTTP client."""
+    from openjiuwen.core.sys_operation.sandbox.gateway.gateway import SandboxGateway
+    from openjiuwen.extensions.sys_operation.sandbox.providers import jiuwenbox as box
+    from jiuwenswarm.common import config
+    from jiuwenswarm.server import agent_ws_server as server, sandbox_config_rpc as rpc
+    from jiuwenswarm.server.sandbox.jiuwenbox_runner import JiuwenBoxRunner
+
+    s = session_runtime
+    s.endpoint.update(url="http://localhost:8321", type="jiuwenbox")
+    s.runtime["policy_tag"] = "old"
+    monkeypatch.setattr(config, "get_sandbox_runtime", lambda: s.runtime)
+    for name in ("_shared_sandbox_ids", "_creation_locks", "_creation_failures", "_lifecycle_hooks",
+                 "_pending_deletions", "_delete_tasks", "_idle_timeout_cache"):
+        monkeypatch.setattr(box._JiuwenBoxProviderMixin, name, {})
+    monkeypatch.setattr(box._JiuwenBoxProviderMixin, "_bulk_deletions", 0)
+    monkeypatch.setattr(box._JiuwenBoxProviderMixin, "_inflight_recreations", set())
+    monkeypatch.setattr(box._JiuwenBoxProviderMixin, "_recreate_lock", None)
+    monkeypatch.delenv("JIUWENBOX_SANDBOX_ID", raising=False)
+    gateway = SandboxGateway()
+    monkeypatch.setattr(SandboxGateway, "_instance", gateway)
+    created, deleted, clients = [], [], []
+
+    def respond(request):
+        if request.method == "POST":
+            sid = f"sandbox-{len(created) + 1}"
+            created.append((request.url.port, json.loads(request.content), sid))
+            return httpx.Response(201, json={"id": sid})
+        sid = request.url.path.split("/")[4]
+        if request.method == "DELETE":
+            deleted.append(sid)
+            return httpx.Response(204)
+        return httpx.Response(200, content=sid.encode())
+
+    def http_client(base_url, **_kwargs):
+        client = httpx.Client(base_url=base_url, transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(box, "build_jiuwenbox_http_client", http_client)
+    root = adapter_type()
+
+    def make_child(sid):
+        child = s.make_child(adapter_type, sid)
+        build = child._create_sandbox_sys_operation
+
+        def card(*args, **kwargs):
+            result = build(*args, **kwargs)
+            result.gateway_config.launcher_config.extra_params["policy"] = {"tag": s.runtime["policy_tag"]}
+            return result
+
+        monkeypatch.setattr(child, "_create_sandbox_sys_operation", card)
+        return child
+
+    monkeypatch.setattr(root, "_new_session_scoped_adapter", make_child)
+
+    async def stop():
+        if owned:
+            await box.retire_jiuwenbox_service("http://localhost:8321")
+
+    runner = SimpleNamespace(stop=AsyncMock(side_effect=stop), get_owned_endpoint=lambda: None)
+    monkeypatch.setattr(JiuwenBoxRunner, "instance", lambda: runner)
+    monkeypatch.setattr(rpc, "_internal_bootstrap", AsyncMock())
+    monkeypatch.setattr(server, "update_sandbox_runtime", lambda patch: s.runtime.update(patch) or dict(s.runtime))
+    owner = SimpleNamespace(_jiuwenbox_runner=runner, _agent_manager=SimpleNamespace(recreate_agent=AsyncMock()))
+    try:
+        old = await root._get_or_create_session_adapter("roundtrip-real-gateway")
+        assert (await old._sys_operation.fs().read_file("/probe")).data.content == "sandbox-1"
+        old_provider = next(iter(gateway._provider_cache.values()))
+        s.runtime["enabled"] = False
+        if entry == "rpc":
+            await rpc._apply_sandbox_change("enabled", strict=True)
+        else:
+            await server.AgentWebSocketServer._handle_sandbox_disable(owner, "web")
+        assert not gateway._provider_cache and not gateway._store.items()
+        assert deleted == ([] if owned else ["sandbox-1"])
+        local = await root._get_or_create_session_adapter("roundtrip-real-gateway")
+        assert local._sys_operation.mode == OperationMode.LOCAL
+
+        s.runtime.update(enabled=True, policy_tag="new")
+        s.endpoint["url"] = "http://localhost:9000"
+        await rpc._apply_sandbox_change("enabled", strict=True)
+        current = await root._get_or_create_session_adapter("roundtrip-real-gateway")
+        result = await current._sys_operation.fs().read_file("/probe")
+        assert result.code == 0 and result.data.content == "sandbox-2"
+        assert created[-1][:2] == (9000, {"policy": {"tag": "new"}})
+        provider = next(iter(gateway._provider_cache.values()))
+        assert provider is not old_provider
+        assert provider.config is current._sys_operation._run_config.config
+        assert list(root._session_adapters) == ["roundtrip-real-gateway"]
+        assert s.warmup.await_count == 3
+    finally:
+        for client in clients:
+            client.close()

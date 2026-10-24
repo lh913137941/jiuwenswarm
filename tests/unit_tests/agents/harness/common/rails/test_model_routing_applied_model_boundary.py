@@ -178,18 +178,21 @@ async def _run_real_chain(extra: dict, summary_models: list[str] | None = None) 
             )
         if summary_models is not None:
             from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
+            from jiuwenswarm.server.runtime.agent_adapter.interface_code import JiuwenSwarmCodeAdapter
+            from jiuwenswarm.server.runtime.agent_adapter.interface_flash import JiuwenSwarmFlashAdapter
 
-            adapter = JiuWenSwarmDeepAdapter.__new__(JiuWenSwarmDeepAdapter)
-            adapter._instance = agent
-            adapter._model_request_config = _build_model("deepseek-v4.1-flash").model_config
-            usage = adapter._new_usage_accumulator()
-            adapter._accumulate_usage(usage, {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12})
-            chunk = adapter._log_and_make_usage_summary_chunk(
-                request_id="r1", channel_id="officeclaw", session_id="boundary-session",
-                usage_accumulator=usage,
-            )
-            assert chunk is not None
-            summary_models.append(chunk.payload["model"])
+            for adapter_type in (JiuWenSwarmDeepAdapter, JiuwenSwarmFlashAdapter, JiuwenSwarmCodeAdapter):
+                adapter = adapter_type.__new__(adapter_type)
+                adapter._instance = agent
+                adapter._model_request_config = _build_model("deepseek-v4.1-flash").model_config
+                usage = adapter._new_usage_accumulator()
+                adapter._accumulate_usage(usage, {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12})
+                chunk = adapter._log_and_make_usage_summary_chunk(
+                    request_id="r1", channel_id="officeclaw", session_id="boundary-session",
+                    usage_accumulator=usage,
+                )
+                assert chunk is not None
+                summary_models.append(chunk.payload["model"])
     finally:
         await Runner.stop()
     return captured
@@ -197,12 +200,14 @@ async def _run_real_chain(extra: dict, summary_models: list[str] | None = None) 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("routing_enabled, expected", [(True, "glm-5.3"), (False, "deepseek-v4.1-flash")])
-async def test_usage_summary_reports_active_model_after_routing(tmp_path, monkeypatch, routing_enabled, expected):
+async def test_usage_summary_reports_active_model_in_deep_flash_and_code(
+    tmp_path, monkeypatch, routing_enabled, expected
+):
     state_file = _write_runtime_state(tmp_path, model="deepseek-v4.1-flash", available_models=["deepseek-v4.1-flash"])
     monkeypatch.setattr(_runtime_prompt_mod, "get_runtime_state_path", lambda session_id=None: state_file)
     models = []
     await _run_real_chain({"model_selection": "deepseek-v4.1-flash", "enable_routing": routing_enabled}, models)
-    assert models == [expected]
+    assert models == [expected, expected, expected]
 
 
 @pytest.mark.asyncio

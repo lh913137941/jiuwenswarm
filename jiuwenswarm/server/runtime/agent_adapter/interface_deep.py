@@ -5531,10 +5531,58 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         """Build the final model-tool filter shared by all Xiaoyi Work modes."""
         return XiaoyiDefaultToolVisibilityRail()
 
+    def _initialize_dynamic_experts(self, config_base: dict[str, Any]) -> None:
+        """Share the feature switch across cold, session-scoped and rebuilt adapters."""
+        self._dynamic_experts_enabled = is_dynamic_experts_enabled(config_base)
+
+    @staticmethod
+    def _is_dynamic_expert_single_mode(mode: str, sub_mode: str | None = None) -> bool:
+        """Accept registered single-agent profiles, including their plan entrypoint.
+
+        A plan round retains its task context, but the rails only permit planning
+        and execution after the normal plan-approval flow restores normal mode.
+        """
+        from jiuwenswarm.common.mode_matrix import base_mode_without_plan, is_team_mode
+        from jiuwenswarm.common.mode_profiles import WORK_MODE_PROFILES
+
+        if sub_mode not in {None, "normal", "plan"} or is_team_mode(mode):
+            return False
+        normal_mode = base_mode_without_plan(mode)
+        return any(
+            normal_mode in {profile.single_canonical, profile.manager_mode}
+            for profile in WORK_MODE_PROFILES.values()
+        )
+
+    def _dynamic_expert_rail_infos(self, mode: str) -> list[_RailBuildInfo]:
+        if not self._dynamic_experts_enabled or not self._is_dynamic_expert_single_mode(
+            mode, self._session_instance_sub_mode,
+        ):
+            return []
+        return [
+            _RailBuildInfo("_dynamic_expert_rail", self._build_dynamic_expert_rail),
+            _RailBuildInfo("_dynamic_expert_confirmation_rail", self._build_dynamic_expert_confirmation_rail),
+        ]
+
+    def _register_dynamic_expert_tools(self, agent_id: str) -> list[Any]:
+        if not self._dynamic_experts_enabled or not self._is_dynamic_expert_single_mode(
+            self._session_instance_mode, self._session_instance_sub_mode,
+        ):
+            return []
+        from jiuwenswarm.symphony.expert_team import ExpertPlanTool
+
+        tool = ExpertPlanTool(lambda session_id: self._dynamic_expert_rounds.get(session_id))
+        self._register_agent_owned_tool(tool, agent_id)
+        return [tool.card]
+
     def _build_dynamic_expert_rail(self) -> Any:
         from jiuwenswarm.symphony.expert_team import DynamicExpertRail
 
         return DynamicExpertRail(lambda session_id: self._dynamic_expert_rounds.get(session_id))
+
+    def _build_dynamic_expert_confirmation_rail(self) -> Any:
+        from jiuwenswarm.symphony.expert_confirmation import DynamicExpertConfirmationRail
+
+        return DynamicExpertConfirmationRail(lambda session_id: self._dynamic_expert_rounds.get(session_id))
 
     @staticmethod
     def _build_work_plan_approval_rail() -> Any | None:
@@ -5559,13 +5607,6 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         mode: str = "agent",
     ) -> list[Any]:
         """Build DeepAgent rails consistently for cold start and hot reload."""
-        dynamic_expert_rails = (
-            [_RailBuildInfo("_dynamic_expert_rail", self._build_dynamic_expert_rail)]
-            if self._dynamic_experts_enabled
-            and os.environ.get("JIUWENSWARM_DESKTOP") == "1"
-            and mode == "agent"
-            else []
-        )
         rail_infos = [
             # InvocationContextRail 不在此声明：它是全模式常驻 rail，由
             # _instantiate_rails 统一装配在首位（agent/code 共用），见该函数注释。
@@ -5598,7 +5639,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 "_tool_visibility_rail",
                 self._build_xiaoyi_default_tool_visibility_rail,
             ),
-            *dynamic_expert_rails,
+            *self._dynamic_expert_rail_infos(mode),
             _RailBuildInfo("_avatar_rail", self._build_avatar_rail),
             _RailBuildInfo("_memory_forbidden_rail", self._build_memory_forbidden_rail),
             _RailBuildInfo("_subagent_rail", self._build_subagent_rail),
@@ -6195,18 +6236,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 exc,
             )
 
-        if (
-            self._dynamic_experts_enabled
-            and os.environ.get("JIUWENSWARM_DESKTOP") == "1"
-            and self._session_instance_mode == "agent"
-        ):
-            from jiuwenswarm.symphony.expert_team import ExpertPlanTool
-
-            expert_plan_tool = ExpertPlanTool(
-                lambda session_id: self._dynamic_expert_rounds.get(session_id)
-            )
-            self._register_agent_owned_tool(expert_plan_tool, agent_id)
-            tool_cards.append(expert_plan_tool.card)
+        tool_cards.extend(self._register_dynamic_expert_tools(agent_id))
 
         # acp_chat: forward prompts to external stdio ACP agents (see acp_agents in config.yaml)
         try:
@@ -6365,7 +6395,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         load_dotenv_runtime(dotenv_path=get_env_file(), override=True)
         config_base = get_config()
         self._config_base_cache = config_base.copy()
-        self._dynamic_experts_enabled = is_dynamic_experts_enabled(config_base)
+        self._initialize_dynamic_experts(config_base)
         self._refresh_multimodal_configs(config_base)
         config = config_base.get("react", {}).copy()
         self._config_cache = config.copy()
@@ -8436,6 +8466,38 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             params
         )
 
+    def _prepare_confirmation_resume(
+        self, session_id: str, params: dict[str, Any], inputs: dict[str, Any],
+    ) -> bool:
+        """Validate the displayed plan ID, then restore Core's original interrupt ID."""
+        from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+        from jiuwenswarm.symphony.expert_confirmation import pending_confirmation
+        from jiuwenswarm.symphony.expert_team import CONFIRMATION_NONCE_KEY, PLAN_TOOL_NAME
+
+        session = getattr(self._instance, "_loop_session", None)
+        if session is None or session.get_session_id() != session_id:
+            return False
+        request_id = str(params.get("request_id") or "")
+        pending = pending_confirmation(session, request_id)
+        if pending is None:
+            return False
+        if pending[0] != PLAN_TOOL_NAME:
+            return True
+        _, call_id, metadata = pending
+        round_state = self._dynamic_expert_rounds.get(session_id)
+        query = inputs.get("query")
+        if (round_state is None or not isinstance(query, InteractiveInput)
+                or query.raw_inputs is not None or set(query.user_inputs) != {request_id}
+                or not isinstance(query.user_inputs[request_id], dict)):
+            return False
+        nonce = round_state.claim_confirmation_resume(session_id, call_id, metadata)
+        if nonce is None:
+            return False
+        core_input = InteractiveInput()
+        core_input.update(call_id, {**query.user_inputs[request_id], CONFIRMATION_NONCE_KEY: nonce})
+        inputs["query"] = core_input
+        return True
+
     def _is_fresh_turn_request(self, params: Any) -> bool:
         """Whether this ``chat.send`` opens a brand-new user turn.
 
@@ -10339,6 +10401,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         error_text: str | None = None
         interaction_stream = None
         interaction_stream_abort = True
+        dynamic_expert_round = None
         # 计费终态判定标记：异常抛出路径置真（终端错误帧由 error_text 兜底判定）
         _billing_failed = False
         # invocation 在 try 内（build_invocation_context 处）才赋值；finally 的计费
@@ -10425,6 +10488,18 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     )
                 interaction_stream = await self._instance.attach_output()
             elif self._should_inject_into_existing_interaction(request.params):
+                if request.params.get("source") == "confirm_interrupt":
+                    if not self._prepare_confirmation_resume(session_id, request.params, inputs):
+                        _billing_failed = True
+                        return AgentResponse(
+                            request_id=request.request_id, channel_id=request.channel_id, ok=False,
+                            payload={
+                                "event_type": "chat.error", "code": "INTERRUPT_EXPIRED",
+                                "error": "这份确认请求已失效，请重新发起任务。",
+                            },
+                            metadata=request.metadata,
+                        )
+                    dynamic_expert_round = self._dynamic_expert_rounds.get(session_id)
                 # Idle → become the reader; busy → inject into the existing stream.
                 interaction_stream = await self._instance.attach_output()
                 await self._instance.send_input(
@@ -10515,6 +10590,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     )
                 except Exception:
                     logger.debug("[Goal] interaction stream close failed", exc_info=True)
+            if dynamic_expert_round is not None and interaction_stream is not None:
+                loop_session = getattr(self._instance, "_loop_session", None)
+                pending_interrupt = loop_session.get_state(INTERRUPTION_KEY) if loop_session is not None else None
+                if interaction_stream_abort or pending_interrupt is None:
+                    await self._close_dynamic_expert_round(session_id, expected=dynamic_expert_round)
             self._unregister_session_agent_task(session_id)
             TOOL_PERMISSION_CHANNEL_ID.reset(token_perm_cid)
             CURRENT_CHANNEL_ID.reset(token_cid)
@@ -11102,14 +11182,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             if self._is_fresh_turn_request(request.params):
                 await self._close_dynamic_expert_round(session_id)
 
-            # Expose a real, model-callable local expert planner only for an
-            # ordinary desktop agent turn. Fixed expert and Team sessions keep
-            # their existing execution path.
+            # Ordinary single-agent work/code/design turns share this lifecycle.
+            # Fixed expert/team bindings and goal/steering retain their own path.
             if (
                 self._dynamic_experts_enabled
-                and os.environ.get("JIUWENSWARM_DESKTOP") == "1"
-                and str(cid or "").lower() == "desktop"
-                and mode == "agent"
+                and self._is_dynamic_expert_single_mode(mode)
                 and isinstance(query, str)
                 and query.strip()
                 and pending_goal_op is None
@@ -11120,10 +11197,12 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 from jiuwenswarm.server.runtime.session.session_metadata import get_session_metadata
 
                 expert_binding = get_session_metadata(session_id) or {}
-                if not expert_binding.get("expert_id"):
+                if not expert_binding.get("expert_id") and not self._current_expert_id:
                     from jiuwenswarm.symphony.expert_team import DynamicExpertRound
 
-                    dynamic_expert_round = DynamicExpertRound(self._instance, query, resolved_model)
+                    dynamic_expert_round = DynamicExpertRound(
+                        self._instance, query, resolved_model, session_id=session_id,
+                    )
                     self._dynamic_expert_rounds[session_id] = dynamic_expert_round
 
             async def _yield_runtime_accepted() -> AsyncIterator[AgentResponseChunk]:
@@ -11249,6 +11328,21 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                     interaction_stream_abort = False
                     return
             elif self._should_inject_into_existing_interaction(request.params):
+                if (request.params.get("source") == "confirm_interrupt"
+                        and not self._prepare_confirmation_resume(session_id, request.params, inputs)):
+                    # Preserve any newer plan when an old card is answered.
+                    dynamic_expert_round = None
+                    interaction_stream_abort = False
+                    _billing_failed = True
+                    yield AgentResponseChunk(
+                        request_id=rid, channel_id=cid,
+                        payload={
+                            "event_type": "chat.error", "code": "INTERRUPT_EXPIRED",
+                            "error": "这份确认请求已失效，请重新发起任务。",
+                        },
+                        is_complete=True,
+                    )
+                    return
                 # Idle → become the reader; busy → inject and accept.
                 # Interrupt resumes (permission/confirm/ask-user) must send_input
                 # even when Goal already holds the output lease.

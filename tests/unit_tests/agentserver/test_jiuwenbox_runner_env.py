@@ -205,7 +205,8 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
     for call in spawn.await_args_list:
         env = call.kwargs["env"]
         if platform == "win32":
-            assert call.kwargs["stdin"] == subprocess.DEVNULL
+            assert call.kwargs["stdin"] == subprocess.PIPE
+            assert call.args[2] == "jiuwenbox.server.parent_control"
         assert env["JIUWENBOX_RUNNER_PYTHON"] == "C:/Python312/python.exe"
         assert env["JIUWENBOX_SKILLS_DIR"] == "C:/workspace/skills"
         assert env["JIUWENBOX_POLICY_PATH"] == str(policy)

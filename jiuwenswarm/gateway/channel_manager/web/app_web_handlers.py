@@ -1619,6 +1619,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             return value
 
     async def _on_connect(ws):
+        if getattr(ws, "_jiuwen_connection_ack_sent", False) or bool(getattr(ws, "closed", False)):
+            return
         ac = _resolve(agent_client)
         if ac is None or not getattr(ac, "server_ready", False):
             logger.debug("[_on_connect] Agent 未就绪，跳过 connection.ack")
@@ -1638,6 +1640,8 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
             timestamp=time.time(),
             ok=True,
             event_type=EventType.CONNECTION_ACK,
+            # The client may have rebound to a real session while awaiting ACK.
+            metadata={"ws_id": getattr(ws, "_jiuwen_ws_id", "")},
             payload={
                 "session_id": sid,
                 "mode": "BUILD",
@@ -1645,13 +1649,33 @@ def _register_web_handlers(bind: WebHandlersBindParams) -> None:
                 "protocol_version": "1.0",
             },
         )
-        mh = _resolve(message_handler)
-        if mh:
-            await mh.publish_robot_messages(ack_msg)
-        else:
-            await channel.send(ack_msg)
+        # Claim before awaiting: the connect hook and readiness callback may race.
+        ws._jiuwen_connection_ack_sent = True
+        try:
+            mh = _resolve(message_handler)
+            if mh:
+                await mh.publish_robot_messages(ack_msg)
+            else:
+                await channel.send(ack_msg)
+        except BaseException:
+            ws._jiuwen_connection_ack_sent = False
+            raise
+
+    async def _on_server_ready():
+        for ws in list(channel.clients):
+            # register_ws precedes assignment of the handshake sid. Its normal
+            # connect hook handles connections still between these two steps.
+            if not getattr(ws, "_jiuwen_initial_sid", None):
+                continue
+            try:
+                await _on_connect(ws)
+            except Exception:
+                logger.exception("Failed to send deferred connection.ack")
 
     channel.on_connect(_on_connect)
+    ready_handler = getattr(_resolve(agent_client), "set_server_ready_handler", None)
+    if callable(ready_handler):
+        ready_handler(_on_server_ready)
 
     async def _config_get(ws, req_id, params, session_id):
         # 返回 _CONFIG_SET_ENV_MAP 里所有键对应的环境变量当前值

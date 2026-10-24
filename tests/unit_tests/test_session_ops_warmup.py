@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from openjiuwen.core.sys_operation import OperationMode
 
 from jiuwenswarm.agents.harness.common import session_ops_service
 
@@ -616,6 +617,11 @@ async def test_get_or_create_new_adapter_refreshes_after_warmup(monkeypatch):
     )
     from jiuwenswarm.server.runtime.session import session_history
 
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.get_sandbox_runtime",
+        lambda: {"enabled": False},
+    )
+
     root = JiuWenSwarmDeepAdapter()
     monkeypatch.setattr(root, "_reload_session_adapter_if_stale", AsyncMock())
     monkeypatch.setattr(root, "_touch_session_adapter", lambda *_a, **_k: None)
@@ -628,6 +634,7 @@ async def test_get_or_create_new_adapter_refreshes_after_warmup(monkeypatch):
         child.create_instance = AsyncMock()
         child.start_interaction = AsyncMock()
         child._instance = object()
+        child._sys_operation = SimpleNamespace(mode=OperationMode.LOCAL)
         created["child"] = child
         return child
 
@@ -673,6 +680,11 @@ async def test_get_or_create_marks_lagged_when_refresh_cannot_catch_up(monkeypat
     )
     from jiuwenswarm.server.runtime.session import session_history
 
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.get_sandbox_runtime",
+        lambda: {"enabled": False},
+    )
+
     root = JiuWenSwarmDeepAdapter()
     monkeypatch.setattr(root, "_reload_session_adapter_if_stale", AsyncMock())
     monkeypatch.setattr(root, "_touch_session_adapter", lambda *_a, **_k: None)
@@ -685,6 +697,7 @@ async def test_get_or_create_marks_lagged_when_refresh_cannot_catch_up(monkeypat
         child.create_instance = AsyncMock()
         child.start_interaction = AsyncMock()
         child._instance = object()
+        child._sys_operation = SimpleNamespace(mode=OperationMode.LOCAL)
         child_holder["child"] = child
         return child
 

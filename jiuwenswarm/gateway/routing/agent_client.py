@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import asyncio
 import json
+import math
+import os
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -234,7 +236,15 @@ class WebSocketAgentServerClient(AgentServerClient):
         self._reconnect_lock = asyncio.Lock()
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
+        try:
+            self._ack_timeout = float(os.getenv("AGENT_CONNECTION_ACK_TIMEOUT_SECONDS", "30"))
+            if not math.isfinite(self._ack_timeout) or self._ack_timeout <= 0:
+                raise ValueError("timeout must be finite and positive")
+        except ValueError:
+            logger.warning("Invalid AGENT_CONNECTION_ACK_TIMEOUT_SECONDS; using 30 seconds")
+            self._ack_timeout = 30.0
         self._server_ready: bool = False
+        self._on_server_ready: Callable[[], Awaitable[None]] | None = None
         # 消息分发机制：根据 request_id 路由到对应队列
         self._message_queues: dict[str, asyncio.Queue] = {}
         self._queue_lock = asyncio.Lock()  # 保护队列操作的锁
@@ -259,6 +269,21 @@ class WebSocketAgentServerClient(AgentServerClient):
     ) -> None:
         """Register a process-local transport-disconnect lifecycle callback."""
         self._on_disconnect = handler
+
+    def set_server_ready_handler(self, handler: Callable[[], Awaitable[None]] | None) -> None:
+        """Notify downstream handshakes when this connection becomes ready."""
+        self._on_server_ready = handler
+
+    async def _mark_server_ready(self) -> None:
+        if self._server_ready:
+            return
+        self._server_ready = True
+        logger.info("[WebSocketAgentServerClient] 收到 connection.ack，AgentServer 已就绪")
+        if self._on_server_ready is not None:
+            try:
+                await self._on_server_ready()
+            except Exception:
+                logger.exception("[WebSocketAgentServerClient] server-ready handler failed")
 
     def _diagnostic_state(self, ws: Any | None = None) -> dict[str, Any]:
         target_ws = self._ws if ws is None else ws
@@ -320,20 +345,19 @@ class WebSocketAgentServerClient(AgentServerClient):
 
         # 读取 AgentServer 的 connection.ack 事件
         try:
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=5.0)
+            raw = await asyncio.wait_for(self._ws.recv(), timeout=self._ack_timeout)
             logger.info("[WebSocketAgentServerClient] connect 首帧(raw): %s", raw)
             data = json.loads(raw)
             logger.info("[WebSocketAgentServerClient] connect 首帧(parsed): %s", _to_json(data))
             if data.get("type") == "event" and data.get("event") == "connection.ack":
-                self._server_ready = True
-                logger.info("[WebSocketAgentServerClient] 收到 connection.ack，AgentServer 已就绪")
+                await self._mark_server_ready()
             else:
                 logger.warning(
                     "[WebSocketAgentServerClient] 首帧非 connection.ack: %s",
                     data.get("type"),
                 )
         except asyncio.TimeoutError:
-            logger.warning("[WebSocketAgentServerClient] 等待 connection.ack 超时")
+            logger.warning("[WebSocketAgentServerClient] 等待 connection.ack 超时 (%ss)", self._ack_timeout)
         except Exception as e:
             logger.warning("[WebSocketAgentServerClient] 读取 connection.ack 失败: %s", e)
 
@@ -388,6 +412,11 @@ class WebSocketAgentServerClient(AgentServerClient):
                 try:
                     raw = await self._ws.recv()
                     data = json.loads(raw)
+                    # Startup may outlast connect()'s initial ACK wait. Consume
+                    # late/repeated ACKs as connection state, not RPC responses.
+                    if data.get("type") == "event" and data.get("event") == "connection.ack":
+                        await self._mark_server_ready()
+                        continue
                     meta = data.get("metadata")
                     if isinstance(meta, dict) and meta.get(E2A_WIRE_SERVER_PUSH_KEY):
                         response_kind = str(data.get("response_kind") or "")

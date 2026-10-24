@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from openjiuwen.core.sys_operation import OperationMode
 
 
 _OJ_MEMORY_MANAGER_MODULE = "openjiuwen.core.memory.lite.manager"
@@ -748,6 +749,11 @@ async def test_deep_adapter_new_session_applies_pending_reload(monkeypatch):
     async def _async_noop(*args, **kwargs):
         return None
 
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.get_sandbox_runtime",
+        lambda: {"enabled": False},
+    )
+
     parent = JiuWenSwarmDeepAdapter()
     parent._instance = MagicMock()
     # Simulate a prior global reload that left a pending config_base (version=1).
@@ -758,6 +764,7 @@ async def test_deep_adapter_new_session_applies_pending_reload(monkeypatch):
 
     new_session = FakeAgent()
     new_session.create_instance = _async_noop
+    new_session._sys_operation = SimpleNamespace(mode=OperationMode.LOCAL)
 
     with patch.object(
         interface_module.JiuWenSwarmDeepAdapter,
@@ -784,6 +791,11 @@ async def test_deep_adapter_new_session_applies_pending_reload(monkeypatch):
 async def test_cancelled_session_initialization_cleans_uncached_child(monkeypatch, stage):
     from jiuwenswarm.server.runtime.agent_adapter.interface_deep import JiuWenSwarmDeepAdapter
 
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.get_sandbox_runtime",
+        lambda: {"enabled": False},
+    )
+
     parent = JiuWenSwarmDeepAdapter()
 
     async def stalled(*_args, **_kwargs):
@@ -791,6 +803,7 @@ async def test_cancelled_session_initialization_cleans_uncached_child(monkeypatc
 
     child = SimpleNamespace(
         create_instance=AsyncMock(), start_interaction=AsyncMock(), cleanup=AsyncMock(),
+        _sys_operation=SimpleNamespace(mode=OperationMode.LOCAL),
     )
     setattr(child, stage, stalled)
     monkeypatch.setattr(parent, "_new_session_scoped_adapter", lambda _sid: child)
@@ -813,6 +826,11 @@ async def test_deep_adapter_new_session_skips_reload_when_no_pending(monkeypatch
     async def _async_noop(*args, **kwargs):
         return None
 
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.agent_adapter.interface_deep.get_sandbox_runtime",
+        lambda: {"enabled": False},
+    )
+
     parent = JiuWenSwarmDeepAdapter()
     parent._instance = MagicMock()
     # No global reload ever happened: version is 0, pending config_base is None.
@@ -821,6 +839,7 @@ async def test_deep_adapter_new_session_skips_reload_when_no_pending(monkeypatch
 
     new_session = FakeAgent()
     new_session.create_instance = _async_noop
+    new_session._sys_operation = SimpleNamespace(mode=OperationMode.LOCAL)
 
     with patch.object(
         interface_module.JiuWenSwarmDeepAdapter,

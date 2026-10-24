@@ -13,6 +13,59 @@ from jiuwenswarm.server.runtime.agent_adapter import interface as interface_modu
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("as_dict", [False, True])
+async def test_handoff_persists_tool_boundary_and_separate_expert_identities(monkeypatch, as_dict):
+    identity = {"expert_id": "", "expert_type": "agent"}
+    records = []
+    handoff = {
+        "success": True, "status": "handed_off", "plan_id": "confirmed-plan",
+        "expert": {"id": "researcher", "name": "资料专家", "source": "cache"},
+    }
+
+    class FakeAdapter:
+        @staticmethod
+        async def process_message_stream_impl(*_args, **_kwargs):
+            events = [
+                {"event_type": "chat.delta", "content": "切换前的说明"},
+                {"event_type": "chat.tool_call", "tool_call_id": "plan-call", "tool_name": "symphony_plan_experts"},
+                {"event_type": "chat.tool_result", "tool_call_id": "plan-call", "tool_name": "symphony_plan_experts",
+                 "raw_output": handoff, "success": True},
+                {"event_type": "chat.delta", "content": "专家完成原任务"},
+                {"event_type": "chat.final", "content": "专家完成原任务"},
+            ]
+            for payload in events:
+                if payload["event_type"] == "chat.tool_result":
+                    identity.update(expert_id="researcher", expert_name="资料专家")
+                yield payload if as_dict else AgentResponseChunk(
+                    request_id="req-handoff", channel_id="desktop", payload=payload, is_complete=False,
+                )
+
+    monkeypatch.setattr(interface_module.JiuWenSwarm, "_ensure_adapter", lambda *_a, **_k: FakeAdapter())
+    monkeypatch.setattr(interface_module, "get_config", lambda: {"memory": {"mode": "disabled"}})
+    monkeypatch.setattr(interface_module, "get_memory_mode", lambda _config: "disabled")
+    monkeypatch.setattr(interface_module, "append_history_record", lambda **record: records.append(record))
+    monkeypatch.setattr(interface_module, "_schedule_symphony_session_feedback", lambda *_args: None)
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.expert.expert_service.history_expert_identity_extra",
+        lambda _session_id: dict(identity),
+    )
+    request = AgentRequest(
+        request_id="req-handoff", channel_id="desktop", session_id="session-handoff",
+        params={"query": "请专家整理资料", "mode": "agent"}, is_stream=True,
+    )
+
+    chunks = [chunk async for chunk in interface_module.JiuWenSwarm().process_message_stream(request)]
+
+    finals = [record for record in records if record.get("event_type") == "chat.final"]
+    assert [(record["content"], record["extra"]["expert_id"]) for record in finals] == [
+        ("切换前的说明", ""), ("专家完成原任务", "researcher"),
+    ]
+    tool_results = [record for record in records if record.get("event_type") == "chat.tool_result"]
+    assert len(tool_results) == 1 and tool_results[0]["extra"]["raw_output"] == handoff
+    assert chunks[-1].is_complete
+
+
+@pytest.mark.asyncio
 async def test_process_message_stream_uses_bounded_handoff_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

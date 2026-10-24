@@ -5601,7 +5601,11 @@ class AgentWebSocketServer:
                 )
         elif request.req_method == ReqMethod.SANDBOX_RESTART:
             try:
-                payload = await self._restart_configured_sandboxes(request.params or {})
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    payload = await self._restart_configured_sandboxes(request.params or {})
                 resp = AgentResponse(request_id=request.request_id, channel_id=request.channel_id,
                                      ok=True, payload=payload, metadata=request.metadata)
             except Exception as exc:
@@ -5614,16 +5618,20 @@ class AgentWebSocketServer:
 
                 # The legacy switch must await readiness too; do not also enqueue
                 # its usual background apply, which could race a following update.
-                resp = dispatch_sandbox_config_request(request, apply_enabled=False)
-                if resp.ok:
-                    try:
-                        await _apply_sandbox_change("enabled", strict=True)
-                    except Exception as exc:
-                        resp = AgentResponse(
-                            request_id=request.request_id, channel_id=request.channel_id,
-                            ok=False, payload={"error": str(exc), "code": "SANDBOX_CONFIG_FAILED"},
-                            metadata=request.metadata,
-                        )
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    resp = dispatch_sandbox_config_request(request, apply_enabled=False)
+                    if resp.ok:
+                        try:
+                            await _apply_sandbox_change("enabled", strict=True)
+                        except Exception as exc:
+                            resp = AgentResponse(
+                                request_id=request.request_id, channel_id=request.channel_id,
+                                ok=False, payload={"error": str(exc), "code": "SANDBOX_CONFIG_FAILED"},
+                                metadata=request.metadata,
+                            )
             else:
                 resp = dispatch_sandbox_config_request(request)
         wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
@@ -7536,10 +7544,15 @@ class AgentWebSocketServer:
                 validate_sandbox_files_runtime(get_sandbox_runtime().get("files"))
                 if sub == "status":
                     payload = {"runtime": get_sandbox_runtime()}
-                elif sub == "enable":
-                    payload = await self._handle_sandbox_enable(channel_id)
-                elif sub == "disable":
-                    payload = await self._handle_sandbox_disable(channel_id)
+                elif sub in {"enable", "disable"}:
+                    apply_lock = getattr(self, "_security_config_apply_lock", None)
+                    if apply_lock is None:
+                        apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                    async with apply_lock:
+                        if sub == "enable":
+                            payload = await self._handle_sandbox_enable(channel_id)
+                        else:
+                            payload = await self._handle_sandbox_disable(channel_id)
                 elif sub == "exclude.add":
                     payload = await self._handle_sandbox_exclude_add(channel_id, params)
                 elif sub == "exclude.remove":

@@ -1731,6 +1731,35 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         lock = self._session_adapter_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             existing = self._session_adapters.get(sid)
+            instance_source = self
+            current_mode = getattr(getattr(existing, "_sys_operation", None), "mode", None)
+            target_mode = OperationMode.SANDBOX if get_sandbox_runtime().get("enabled") else OperationMode.LOCAL
+            if (
+                existing is not None
+                and current_mode in (OperationMode.LOCAL, OperationMode.SANDBOX)
+                and current_mode != target_mode
+                and not existing._is_session_live(sid)
+            ):
+                # Changing the switch cannot rebind tools holding the old
+                # SysOperation. Reuse the normal build and history warmup below
+                # for either direction, keeping the same product session.
+                instance_source = existing
+                await existing.cleanup()
+                self._drop_session_adapter_cache_entry(sid, remove_lock=False, remove_runtime_state=False)
+                existing = None
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] rebuilding session runtime after sandbox switch: "
+                    "session_id=%s mode=%s->%s", sid, current_mode, target_mode,
+                )
+            elif (
+                existing is not None
+                and current_mode in (OperationMode.LOCAL, OperationMode.SANDBOX)
+                and current_mode != target_mode
+            ):
+                logger.info(
+                    "[JiuWenSwarmDeepAdapter] sandbox switch deferred until session is idle: "
+                    "session_id=%s mode=%s->%s", sid, current_mode, target_mode,
+                )
             if existing is not None:
                 await self._reload_session_adapter_if_stale(sid, existing)
                 # 预热实例的 create 期专家重放早于 metadata 写入（空放）；
@@ -1770,8 +1799,8 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
 
             adapter = self._new_session_scoped_adapter(sid)
             config = (
-                dict(self._session_instance_config)
-                if isinstance(self._session_instance_config, dict)
+                dict(instance_source._session_instance_config)
+                if isinstance(instance_source._session_instance_config, dict)
                 else None
             )
             create_started_at = time.monotonic()
@@ -1781,9 +1810,16 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                 async with stall_watchdog(f"create_instance sid={sid}"):
                     await adapter.create_instance(
                         config,
-                        mode=self._session_instance_mode,
-                        sub_mode=self._session_instance_sub_mode,
+                        mode=instance_source._session_instance_mode,
+                        sub_mode=instance_source._session_instance_sub_mode,
                     )
+                    actual_mode = getattr(getattr(adapter, "_sys_operation", None), "mode", None)
+                    if actual_mode != target_mode:
+                        actual_name = actual_mode.value if isinstance(actual_mode, OperationMode) else "unknown"
+                        raise RuntimeError(
+                            f"执行器模式未生效（期望 {target_mode.value} / 实际 {actual_name}），"
+                            "请检查沙箱开关、服务与端点配置后重试"
+                        )
                 instance_ready_at = time.monotonic()
 
                 async with stall_watchdog(f"start_interaction sid={sid}", first_after_seconds=15.0):

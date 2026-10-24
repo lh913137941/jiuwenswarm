@@ -1,5 +1,6 @@
 """Disable and restart share lifecycle cleanup across current and historical URLs."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -8,6 +9,94 @@ import pytest
 
 from jiuwenswarm.server import sandbox_lifecycle as lifecycle
 from openjiuwen.extensions.sys_operation.sandbox.providers import jiuwenbox as box
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second", [
+    ("enable", "rpc"), ("disable", "rpc"), ("rpc", "enable"), ("rpc", "disable"),
+    ("restart", "rpc"), ("rpc", "restart"), ("enable", "restart"), ("restart", "disable"),
+])
+@pytest.mark.parametrize("fail_first", [False, True])
+async def test_rpc_commands_and_restart_share_apply_lock(monkeypatch, first, second, fail_first):
+    from jiuwenswarm.common.schema.agent import AgentRequest, AgentResponse
+    from jiuwenswarm.common.schema.message import ReqMethod
+    from jiuwenswarm.common.security_config_service import SecurityConfigService
+    from jiuwenswarm.server import agent_ws_server as server, sandbox_config_rpc as rpc
+
+    owner = server.AgentWebSocketServer.__new__(server.AgentWebSocketServer)
+    entered, release = asyncio.Event(), asyncio.Event()
+    events, responses = [], []
+
+    async def apply(kind):
+        assert owner._security_config_apply_lock.locked()
+        events.append((kind, "begin"))
+        if kind == first:
+            entered.set()
+            await release.wait()
+        events.append((kind, "end"))
+        if kind == first and fail_first:
+            raise RuntimeError("first application failed")
+        return {}
+
+    async def rpc_apply(_kind, *, strict):
+        assert strict
+        await apply("rpc")
+
+    def dispatch(request, *, apply_enabled):
+        assert not apply_enabled
+        assert owner._security_config_apply_lock.locked()
+        return AgentResponse(request_id=request.request_id, channel_id="test", ok=True, payload={})
+
+    async def enable(_):
+        return await apply("enable")
+
+    async def disable(_):
+        return await apply("disable")
+
+    async def restart(_):
+        return await apply("restart")
+
+    owner._handle_sandbox_enable = enable
+    owner._handle_sandbox_disable = disable
+    owner._restart_configured_sandboxes = restart
+    owner._attach_effective_sandbox_files = Mock()
+    owner._attach_landlock_status = AsyncMock()
+    monkeypatch.setattr(SecurityConfigService, "is_initialized", lambda _: False)
+    monkeypatch.setattr(server, "_require_sandbox_supported", Mock())
+    monkeypatch.setattr(server, "get_sandbox_runtime", lambda: {})
+    monkeypatch.setattr(server, "get_sandbox_endpoint", lambda: {"type": "jiuwenbox"})
+    monkeypatch.setattr(rpc, "dispatch_sandbox_config_request", dispatch)
+    monkeypatch.setattr(rpc, "_apply_sandbox_change", rpc_apply)
+    monkeypatch.setattr(server, "encode_agent_response_for_wire", lambda response, **_: response)
+    monkeypatch.setattr(server, "send_wire_payload", AsyncMock(side_effect=lambda _, response: responses.append(response)))
+
+    async def invoke(kind):
+        command = kind in {"enable", "disable"}
+        request = AgentRequest(
+            request_id=kind, channel_id="test",
+            req_method=ReqMethod.COMMAND_SANDBOX if command else (
+                ReqMethod.SANDBOX_RESTART if kind == "restart" else ReqMethod.SANDBOX_ENABLED_SET
+            ),
+            params={"sub": kind} if command else {"enabled": True},
+        )
+        handler = owner._handle_command_sandbox if command else owner._handle_sandbox_config
+        await handler(None, request, asyncio.Lock())
+
+    task1 = asyncio.create_task(invoke(first))
+    task2 = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        task2 = asyncio.create_task(invoke(second))
+        await asyncio.sleep(0)
+        assert events == [(first, "begin")]
+        assert not task2.done()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(task1, task2), 1)
+        assert events == [(first, "begin"), (first, "end"), (second, "begin"), (second, "end")]
+        assert {r.request_id: r.ok for r in responses} == {first: not fail_first, second: True}
+    finally:
+        release.set()
+        await asyncio.gather(*(t for t in (task1, task2) if t is not None), return_exceptions=True)
 
 
 @pytest.fixture(autouse=True)

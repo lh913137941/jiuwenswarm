@@ -176,6 +176,8 @@ CLAUDE.md 旧表述「凭据齐全才拉起 gateway」**已过时**。当前实�
   - xiaoyi 管道断连由 `_reconnect_loop` 5s 退避重连。
 - **E2A stdio 与管道的关系**：stdio 是主进程↔AgentServer 的主通道（fd 继承，天然私有）；`claw-agent-e2a` 是 Gateway 兄弟进程↔AgentServer 的旁路（兄弟进程拿不到对方的 stdio，必须用命名管道）。两者共用 `run_connection` 连接内核与同一套帧。
 
+Gateway 首次等待 AgentServer 的 `connection.ack` 默认最多 30 秒；启动 Gateway 前可通过环境变量 `AGENT_CONNECTION_ACK_TIMEOUT_SECONDS` 配置秒数（例如 PowerShell：`$env:AGENT_CONNECTION_ACK_TIMEOUT_SECONDS='60'`）。该值须为有限正数，非法值记录警告并回退 30 秒；这是连接建立后的首帧等待，不改变管道连接、认证或业务 RPC 的超时。启动较慢时，超时仍保留连接，后台接收循环收到迟到 ACK 后更新 `server_ready`，并向 WebChannel 中仍连接、尚未确认握手的客户端补发 `connection.ack`，包括 cron 管道客户端，无需重新连接。补发保留各连接原始握手 session_id，并以 ws_id 定向投递，避免会话重绑定后丢失确认；连接钩子与补发并发、重复 ACK 或上游重连都不会重复确认同一客户端，单个客户端失败不影响其他客户端。迟到或重复 ACK 属于连接控制帧，不进入请求队列或业务推送回调；普通响应和其他事件不会把服务标记为就绪，断连后仍清除就绪状态。回归覆盖命名管道与 WebSocket 两种传输的配置及非法值、真实首帧超时、非 ACK 首帧、正常及重复 ACK、已连接客户端的补发、断连跳过与并发去重。
+
 ### 2.5 密钥下发：stdin 首帧密钥包（为什么不用 env）
 
 - **桌面侧**：`src/core/runtime/secrets-frame.ts`（`buildSecretsFrame`/`writeSecretsFrame`）；spawn 后立即写入 stdin 首帧，按角色最小子集组包（runtime-service.ts:414-453）：

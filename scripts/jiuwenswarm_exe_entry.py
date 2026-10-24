@@ -306,20 +306,19 @@ def _run_win_setup() -> None:
 
 def _run_jiuwenbox_server() -> None:
     import argparse
-    import uvicorn
 
     _unshadow_frozen_jiuwenbox_namespace()
     from jiuwenbox.server.app import app as jiuwenbox_app
+    from jiuwenbox.server.parent_control import run_server
 
     parser = argparse.ArgumentParser(prog="jiuwenswarm --desktop-run-jiuwenbox")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8321)
     args, _unknown = parser.parse_known_args()
-    uvicorn.run(
+    run_server(
         jiuwenbox_app,
         host=args.host,
         port=args.port,
-        log_level="info",
     )
 
 

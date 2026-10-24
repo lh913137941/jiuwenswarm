@@ -76,7 +76,10 @@ async def build_pending_fixture(
     monkeypatch.setattr(expert_team, "_subagent_config", lambda _agent, expert, _model: expert.id)
     monkeypatch.setattr(expert_team, "apply_extension_hot", bind)
     monkeypatch.setattr(expert_team, "unapply_extension_hot", AsyncMock())
-    round_state = expert_team.DynamicExpertRound(agent, "请专家整理资料", model, session_id=session.get_session_id())
+    handoff = AsyncMock(return_value=[])
+    round_state = expert_team.DynamicExpertRound(
+        agent, "请专家整理资料", model, session_id=session.get_session_id(), handoff_expert=handoff,
+    )
     rail = DynamicExpertConfirmationRail(lambda sid: round_state if sid == round_state.session_id else None)
     tool = expert_team.ExpertPlanTool(lambda sid: round_state if sid == round_state.session_id else None)
     payload = None
@@ -92,7 +95,7 @@ async def build_pending_fixture(
             SimpleNamespace(id=request_id, value=request) for request_id, request in requests
         ])
     return SimpleNamespace(agent=agent, session=session, call=call, ctx=ctx, round=round_state,
-                           rail=rail, tool=tool, payload=payload, scan=scan, bind=bind, model=model)
+                           rail=rail, tool=tool, payload=payload, scan=scan, bind=bind, model=model, handoff=handoff)
 
 
 def prepare_resume_inputs(fixture, answers, *, request_id=None):
@@ -196,8 +199,12 @@ async def test_single_expert_description_fits_card_without_changing_execution(
     assert fixture.round._selected_experts["e0"].description == description
     assert fixture.round.confirmation_display(question["expert_plan"]["plan_id"]) == question["expert_plan"]
     fixture.bind.assert_not_awaited()
-    ready = await apply_answers(fixture, [{"selected_options": ["召唤专家处理"]}])
-    assert ready["planned_graph"]["graph"]["nodes"]["e0"]["task"] == "整理第1部分资料"
+    ready = await apply_answers(fixture, [{"selected_options": ["确认并切换专家"]}])
+    assert ready["status"] == "handed_off"
+    assert ready["expert"] == {"id": "e0", "name": "专家1", "source": source}
+    assert "planned_graph" not in ready and "bindings" not in ready
+    fixture.handoff.assert_awaited_once()
+    fixture.bind.assert_not_awaited()
     assert "summary" not in json.dumps(ready, ensure_ascii=False)
     fixture.model.invoke.assert_awaited_once()
 
@@ -285,7 +292,7 @@ async def test_stop_cancels_pending_planning_model_call(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_confirmation_resumes_saved_plan_once_and_returns_compatible_ready(monkeypatch):
-    fixture = await build_pending_fixture(monkeypatch)
+    fixture = await build_pending_fixture(monkeypatch, selected_count=2)
     original_plan = fixture.round.pending_plan
     assert fixture.round.plan is None
     assert (await fixture.tool.invoke({}, session=fixture.session))["reason"] == "expert_confirmation_required"
@@ -301,7 +308,8 @@ async def test_confirmation_resumes_saved_plan_once_and_returns_compatible_ready
     ready = await apply_answers(fixture, [{"selected_options": ["开始专家协作"]}])
     assert ready == {
         "success": True, "status": "ready", "planned_graph": {"graph": original_plan},
-        "bindings": {"e0": expert_team._subagent_type("e0")}, "expert_assets": {"e0": {"source": "local"}},
+        "bindings": {key: expert_team._subagent_type(key) for key in ("e0", "e1")},
+        "expert_assets": {key: {"source": "local"} for key in ("e0", "e1")},
     }
     assert fixture.round.plan is original_plan
     repeated = await apply_answers(fixture, [{"selected_options": ["确认并开始"]}])
@@ -309,7 +317,47 @@ async def test_confirmation_resumes_saved_plan_once_and_returns_compatible_ready
     fixture.scan.assert_awaited_once()
     assert fixture.model.invoke.await_count == 1
     fixture.bind.assert_awaited_once()
-    assert fixture.bind.await_args.args[1].subagents == ["e0"]
+    assert fixture.bind.await_args.args[1].subagents == ["e0", "e1"]
+    fixture.handoff.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["确认并切换专家", "召唤专家处理", "交给专家处理"])
+async def test_single_expert_confirmation_hands_off_once_without_delegation(monkeypatch, label):
+    fixture = await build_pending_fixture(monkeypatch, sources={"e0": "cache"}, avatars={"e0": "avatar.png"})
+    selected = fixture.round._selected_experts["e0"]
+    fixture.scan.return_value = {}  # Confirmation consumes the frozen selection, never rescans.
+    result = await apply_answers(fixture, [{"selected_options": [label]}])
+    assert result == {
+        "success": True, "status": "handed_off",
+        "plan_id": fixture.payload["request_id"].removeprefix("symphony-plan:"),
+        "expert": {"id": "e0", "name": "专家1", "source": "cache", "avatar": "avatar.png"},
+    }
+    fixture.handoff.assert_awaited_once_with(fixture.round, selected)
+    fixture.bind.assert_not_awaited()
+    assert fixture.round.plan is None and fixture.round._bindings == {} and fixture.round._refs == []
+    assert "task_tool" not in fixture.round.guidance()
+    assert not fixture.ctx.has_force_finish_request
+    assert (await apply_answers(fixture, [{"selected_options": [label]}]))["reason"] == "expert_confirmation_expired"
+    fixture.handoff.assert_awaited_once()
+    await fixture.round.close()
+    expert_team.unapply_extension_hot.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_single_expert_handoff_failure_force_finishes_without_running_original_task(monkeypatch):
+    fixture = await build_pending_fixture(monkeypatch)
+    fixture.handoff.side_effect = RuntimeError("expert_metadata_write_failed")
+    result = await apply_answers(fixture, [{"selected_options": ["确认并切换专家"]}])
+    assert result == {
+        "success": False, "status": "handoff_failed", "reason": "expert_metadata_write_failed",
+        "plan_id": fixture.payload["request_id"].removeprefix("symphony-plan:"),
+    }
+    assert fixture.ctx.has_force_finish_request
+    assert fixture.round.pending_plan is None and fixture.round._selected_experts == {}
+    assert fixture.session.get_state(expert_team.CONFIRMATION_STATE_KEY) is None
+    assert "重试" in fixture.round.guidance()
+    fixture.bind.assert_not_awaited()
 
 
 @pytest.mark.asyncio

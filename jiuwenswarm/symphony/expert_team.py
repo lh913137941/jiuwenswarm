@@ -8,7 +8,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from openjiuwen.core.foundation.llm import ToolMessage
@@ -200,13 +200,18 @@ def _subagent_config(agent: Any, expert: LocalExpert, model: Any) -> SubAgentCon
 class DynamicExpertRound:
     """One request's bound experts and dependency-aware task_tool state."""
 
-    def __init__(self, agent: Any, query: str, model: Any, *, session_id: str = "") -> None:
+    def __init__(
+        self, agent: Any, query: str, model: Any, *, session_id: str = "",
+        handoff_expert: Callable[[DynamicExpertRound, LocalExpert], Awaitable[list[str]]] | None = None,
+    ) -> None:
         self.agent = agent
         self.query = query
         self._base_query = ""
         self._revision_feedback: list[str] = []
         self.model = model
         self.session_id = session_id
+        self._handoff_expert = handoff_expert
+        self._handoff_tool_names: list[str] = []
         self.plan: dict[str, Any] | None = None
         self.pending_plan: dict[str, Any] | None = None
         self.candidate_count = 0
@@ -432,6 +437,8 @@ class DynamicExpertRound:
                 return self.response or {"success": False, "status": "error", "reason": "round_closed"}
             graph = self.pending_plan
             nodes = graph["nodes"]
+            if len(nodes) == 1:
+                return await self._confirm_single_expert(metadata["dynamic_expert_plan_id"])
             refs = []
             try:
                 # The pinned Core rolls back a partially applied batch itself.
@@ -499,6 +506,34 @@ class DynamicExpertRound:
             self._selected_experts = {}
             self.clear_confirmation_state()
             return self.response
+
+    async def _confirm_single_expert(self, plan_id: str) -> dict[str, Any]:
+        """Transfer the confirmed package to the current session, never a child agent."""
+        expert = next(iter(self._selected_experts.values()))
+        try:
+            if self._handoff_expert is None:
+                raise RuntimeError("expert_handoff_unavailable")
+            self._handoff_tool_names = await self._handoff_expert(self, expert)
+            self.response = {
+                "success": True, "status": "handed_off", "plan_id": plan_id,
+                "expert": {
+                    "id": expert.id, "name": expert.name, "source": expert.source,
+                    **({"avatar": expert.avatar} if expert.avatar else {}),
+                },
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the adapter rolls back before returning
+            _warn("[symphony.experts] session handoff failed: %s", exc)
+            self.response = {
+                "success": False, "status": "handoff_failed", "plan_id": plan_id, "reason": str(exc),
+            }
+        finally:
+            self.pending_plan = None
+            self._selected_configs = {}
+            self._selected_experts = {}
+            self.clear_confirmation_state()
+        return self.response
 
     def _task_context(self, expert_id: str, model_task: str) -> str:
         assert self.plan is not None
@@ -569,6 +604,10 @@ class DynamicExpertRound:
     def guidance(self) -> str:
         if self.pending_plan is not None:
             return "专家协作方案正在等待用户确认。确认前不得调用 task_tool 或声称专家已执行。"
+        if self.response is not None and self.response.get("status") == "handed_off":
+            return "已切换到用户确认的专家。请以当前专家身份和已加载的工具、技能继续完成原任务。"
+        if self.response is not None and self.response.get("status") == "handoff_failed":
+            return "专家切换失败，本轮已停止。请提示用户重试，等待新的用户请求。"
         if self.plan is None:
             if self.response is None:
                 return (
@@ -684,7 +723,10 @@ class ExpertPlanTool(Tool):
                 "Prepares a plan and waits for explicit user confirmation before binding experts. "
                 "If the user declines, continue the original task without experts. "
                 "If the user provides feedback, revise the plan and request confirmation again. "
-                "After confirmation returns a planned_graph and task_tool subagent_type names, or no_plan if no usable "
+                "After confirmation, a single expert returns handed_off and becomes this session's identity; "
+                "continue the original task directly with that expert's loaded tools and skills. "
+                "Multiple experts return a planned_graph and task_tool subagent_type names. "
+                "handoff_failed stops the turn and requires the user to retry. Returns no_plan if no usable "
                 "expert plan is available. On no_plan, continue the normal task workflow. "
                 "Do not call for an already summoned fixed expert team."
             ),
@@ -761,8 +803,14 @@ class DynamicExpertRail(DeepAgentRail):
             tools = [tool for tool in tools if self._tool_name(tool) not in _COMPETING_DELEGATION_TOOLS]
             if builder is not None:
                 builder.remove_section("symphony_orchestration")
+        names = []
         if not round_state.attempted or round_state.plan is not None:
             names = ["task_tool"] if round_state.plan is not None else [PLAN_TOOL_NAME]
+        elif round_state.response is not None and round_state.response.get("status") == "handed_off":
+            # ReAct captured this invoke's tool menu before resuming the paused
+            # confirmation. Refresh only tools added by the selected package.
+            names = round_state._handoff_tool_names
+        if names:
             refreshed = await self._agent.ability_manager.list_tool_info(names=names)
             for info in refreshed:
                 tools = [tool for tool in tools if self._tool_name(tool) != info.name]

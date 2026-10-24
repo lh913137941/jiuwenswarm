@@ -59,8 +59,15 @@ def _make_package(root: Path, name: str, persona: str) -> Path:
     return pkg
 
 
-def _make_child_adapter(session_id: str) -> JiuWenSwarmDeepAdapter:
-    adapter = JiuWenSwarmDeepAdapter()
+def _make_child_adapter(session_id: str, work_mode: str = "work") -> JiuWenSwarmDeepAdapter:
+    from jiuwenswarm.common.mode_profiles import profile_for_work_mode
+    from jiuwenswarm.server.runtime.agent_adapter.interface_code import JiuwenSwarmCodeAdapter
+
+    profile = profile_for_work_mode(work_mode)
+    adapter = JiuWenSwarmDeepAdapter() if profile.adapter_kind == "deep" else JiuwenSwarmCodeAdapter()
+    adapter._session_instance_mode = profile.manager_mode
+    adapter._session_instance_sub_mode = "normal" if work_mode == "code" else None
+    adapter._static_prompt_profile = work_mode
     adapter._instance = create_deep_agent(
         model=_make_model(), system_prompt=ORIGINAL_IDENTITY, workspace=tempfile.mkdtemp()
     )

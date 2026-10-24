@@ -2653,6 +2653,7 @@ class JiuWenSwarm:
         final_answer_content = ""
         final_answer_chunks: list[str] = []
         durable_pending_final_chunks: list[str] = []
+        durable_pending_final_extra: dict[str, Any] = {}
         durable_pending_reasoning_chunks: list[str] = []
         durable_final_content = ""
 
@@ -2671,15 +2672,27 @@ class JiuWenSwarm:
             return merged
 
         def _persist_pending_final_text(aborted: bool = False) -> None:
-            nonlocal durable_pending_final_chunks, durable_final_content
+            nonlocal durable_pending_final_chunks, durable_pending_final_extra, durable_final_content
             pending_text = "".join(durable_pending_final_chunks)
             durable_pending_final_chunks = []
+            extra_fields = durable_pending_final_extra
+            durable_pending_final_extra = {}
             # 取消终态独立于正文：工具阶段/零正文也必须留痕。
-            if not aborted and (not pending_text or pending_text == durable_final_content):
+            if not aborted and (not pending_text or (pending_text == durable_final_content and not extra_fields)):
                 return
             from jiuwenswarm.server.runtime.expert.expert_service import (
                 history_expert_identity_extra,
             )
+            # Match ordinary final persistence: explicit final metadata wins
+            # over request defaults; cancellation and streamed reasoning win
+            # over the corresponding snapshot fields.
+            if "expert_id" not in extra_fields:
+                extra_fields.update(history_expert_identity_extra(session_id))
+            for key in ("source", "proactive_type", "proactive_target"):
+                if key not in extra_fields and key in request.params:
+                    extra_fields[key] = request.params[key]
+            if aborted:
+                extra_fields["aborted"] = True
 
             append_history_record(
                 session_id=session_id,
@@ -2694,14 +2707,7 @@ class JiuWenSwarm:
                 # 专家身份快照：按写盘时刻会话绑定记录"当时是谁答的"。
                 # aborted：中断 flush（CancelledError 路径）写"已停止"语义标记——
                 # 重启后前端据它显示「已停止」而非回落「已完成」。
-                extra=_attach_reasoning_content({
-                    **{
-                        k: v for k, v in request.params.items()
-                        if k in ("source", "proactive_type", "proactive_target")
-                    },
-                    **history_expert_identity_extra(session_id),
-                    **({"aborted": True} if aborted else {}),
-                }),
+                extra=_attach_reasoning_content(extra_fields),
                 mode=request.params.get("mode", "unknown"),
             )
             durable_final_content = pending_text
@@ -2722,12 +2728,37 @@ class JiuWenSwarm:
             _put_count = 0
             producer_stream: AsyncIterator[AgentResponseChunk] | None = None
             try:
+                from jiuwenswarm.server.runtime.expert.expert_service import history_expert_identity_extra
+
+                # Snapshot before the producer can resume the confirmed tool. The
+                # bounded queue's consumer may run after metadata has already changed.
+                stream_expert_identity = history_expert_identity_extra(session_id)
                 producer_stream = adapter.process_message_stream_impl(request, inputs)
                 async for chunk in producer_stream:
                     # 底层读取清理可能吞掉 CancelledError；消费者已退出时，
                     # 不能继续写入有界队列，否则会卡住并一直占用输出租约。
                     if asyncio.current_task().cancelling():
                         raise asyncio.CancelledError
+                    payload = chunk if isinstance(chunk, dict) else getattr(chunk, "payload", None)
+                    if isinstance(payload, dict) and not payload.get("member_name"):
+                        raw_output = payload.get("raw_output")
+                        if (
+                            payload.get("event_type") == "chat.tool_result"
+                            and payload.get("tool_name") == "symphony_plan_experts"
+                            and isinstance(raw_output, dict)
+                            and raw_output.get("success") is True
+                            and raw_output.get("status") == "handed_off"
+                        ):
+                            stream_expert_identity = history_expert_identity_extra(session_id)
+                        if payload.get("event_type") in {"chat.delta", "chat.final", "chat.error"}:
+                            if "expert_id" in payload:
+                                # Later empty finals may carry only usage. Keep
+                                # an explicit identity from this segment's final.
+                                stream_expert_identity = {
+                                    key: value for key, value in payload.items() if key.startswith("expert_")
+                                }
+                            else:
+                                payload.update(stream_expert_identity)
                     _put_count += 1
                     if _put_count <= 3:
                         _pl = getattr(chunk, "payload", None) or {}
@@ -2961,6 +2992,9 @@ class JiuWenSwarm:
                                 # 后续冲刷混进 leader 的历史记录（与下方豁免同规）
                                 if not data.payload.get("member_name"):
                                     durable_pending_final_chunks.append(payload_content)
+                                    durable_pending_final_extra.update({
+                                        key: value for key, value in data.payload.items() if key.startswith("expert_")
+                                    })
                                 should_record = False
                             elif et == "chat.reasoning":
                                 durable_pending_reasoning_chunks.append(payload_content)
@@ -3123,6 +3157,9 @@ class JiuWenSwarm:
                             # 成员 delta 不进主应答待落盘 buffer（与 chunk 分支同规）
                             if not data.get("member_name"):
                                 durable_pending_final_chunks.append(payload_content)
+                                durable_pending_final_extra.update({
+                                    key: value for key, value in data.items() if key.startswith("expert_")
+                                })
                             should_record = False
                         elif et == "chat.reasoning":
                             durable_pending_reasoning_chunks.append(payload_content)

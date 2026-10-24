@@ -509,14 +509,29 @@ def test_scene_hook_approves_ask_user_on_first_pass():
     assert outcome == ("approve",)
 
 
-def test_scene_hook_leaves_other_tools_to_engine():
+@pytest.mark.parametrize("tool_name", ["bash", "task_tool"])
+def test_scene_hook_leaves_other_tools_to_engine(tool_name):
     """Non-interactive tools must still fall through to the tiered engine
     (returns ``None``) when no owner-scope context is set."""
     hook = _permission_scene_hook()
 
-    outcome = asyncio.run(hook(_scene_hook_input("bash", None)))
+    outcome = asyncio.run(hook(_scene_hook_input(tool_name, None)))
 
     assert outcome is None
+
+
+def test_expert_confirmation_exemption_preserves_digital_avatar_restriction():
+    from jiuwenswarm.agents.harness.common.rails.permissions.owner_scopes import (
+        PermissionContext, TOOL_PERMISSION_CONTEXT,
+    )
+
+    hook = _permission_scene_hook()
+    token = TOOL_PERMISSION_CONTEXT.set(PermissionContext(group_digital_avatar=True))
+    try:
+        outcome = asyncio.run(hook(_scene_hook_input("symphony_plan_experts", {"approved": True})))
+    finally:
+        TOOL_PERMISSION_CONTEXT.reset(token)
+    assert outcome[0] == "reject"
 
 
 def test_build_permission_rail_wires_session_persist_hook():

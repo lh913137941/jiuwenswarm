@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -75,9 +76,31 @@ def _make_adapter(**state: object) -> JiuWenSwarmDeepAdapter:
     adapter._is_session_scoped_adapter = True  # pylint: disable=protected-access
     adapter._parent_session_id = None  # pylint: disable=protected-access
     adapter._session_adapter_last_used = {}  # pylint: disable=protected-access
+    adapter._dynamic_expert_rounds = {}  # pylint: disable=protected-access
     for name, value in state.items():
         setattr(adapter, name, value)
     return adapter
+
+
+@pytest.mark.asyncio
+async def test_close_dynamic_expert_round_only_releases_matching_round() -> None:
+    """A delayed stream cleanup must not unbind a newer expert round."""
+    old_round = SimpleNamespace(close=AsyncMock())
+    current_round = SimpleNamespace(close=AsyncMock())
+    prompt_builder = SimpleNamespace(remove_section=MagicMock())
+    adapter = _make_adapter(
+        _instance=SimpleNamespace(system_prompt_builder=prompt_builder),
+        _dynamic_expert_rounds={"session-1": current_round},
+    )
+
+    await adapter._close_dynamic_expert_round("session-1", expected=old_round)
+    assert adapter._dynamic_expert_rounds["session-1"] is current_round
+    current_round.close.assert_not_awaited()
+
+    await adapter._close_dynamic_expert_round("session-1", expected=current_round)
+    assert "session-1" not in adapter._dynamic_expert_rounds
+    current_round.close.assert_awaited_once_with()
+    prompt_builder.remove_section.assert_called_once_with("symphony_expert_turn")
 
 
 @pytest.mark.asyncio
@@ -111,6 +134,344 @@ async def test_closing_delegated_stream_releases_session_output_lease():
     finally:
         await outer.aclose()
         await inner.aclose()
+
+
+def _dynamic_stream_adapter(monkeypatch, instance) -> JiuWenSwarmDeepAdapter:
+    """Use the real streaming entrypoint with unrelated runtime setup disabled."""
+    adapter = JiuWenSwarmDeepAdapter()
+    adapter._is_session_scoped_adapter = True
+    adapter._dynamic_experts_enabled = True
+    adapter._instance = instance
+    monkeypatch.setenv("JIUWENSWARM_DESKTOP", "1")
+    monkeypatch.setattr(adapter, "_bind_invoke_workspace_context", lambda: None)
+    monkeypatch.setattr(adapter, "_discard_stale_interrupt_for_fresh_turn", AsyncMock())
+    monkeypatch.setattr(adapter, "_has_valid_model_config", lambda *_: True)
+    monkeypatch.setattr(adapter, "_handle_slash_command", AsyncMock(return_value=None))
+    monkeypatch.setattr(adapter, "_resolve_model_for_request", lambda *_: None)
+    monkeypatch.setattr(adapter, "_apply_model_to_react_agent", lambda *_, **__: None)
+    monkeypatch.setattr(adapter, "_update_runtime_config", AsyncMock())
+    monkeypatch.setattr(adapter, "_bind_runtime_cron_context", lambda **_: None)
+    monkeypatch.setattr(adapter, "_reset_runtime_cron_context", lambda *_: None)
+    monkeypatch.setattr(adapter, "_begin_visible_chat_content", lambda *_: None)
+    monkeypatch.setattr(adapter, "_mark_history_tail_synced", lambda *_: None)
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.session.session_metadata.get_session_metadata", lambda *_: {},
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.server.runtime.debug_trace.config.resolve_debug_trace_settings",
+        lambda **_: SimpleNamespace(enabled=False, dump_enabled=False, otel_enabled=False),
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.agent_observability.sync_agent_observability", lambda **_: None,
+    )
+    monkeypatch.setattr(
+        "jiuwenswarm.agents.harness.agent_observability.open_agent_run_span", lambda **_: None,
+    )
+    return adapter
+
+
+@pytest.mark.parametrize("consumer_action", ["close", "cancel"])
+@pytest.mark.asyncio
+async def test_output_close_aborts_planner_before_dynamic_expert_cleanup(
+    monkeypatch: pytest.MonkeyPatch, consumer_action: str,
+) -> None:
+    """独立 producer 持规划锁时，关流必须先中止它，再清理专家轮次。"""
+    from openjiuwen.harness.schema.interaction import InteractionOutputStream, OutputLeaseManager
+    from jiuwenswarm.symphony import expert_team
+
+    sid = "dynamic-stream-close"
+    leases = OutputLeaseManager()
+    planner_started = asyncio.Event()
+    release_planner = asyncio.Event()
+    first_chunk_seen = asyncio.Event()
+    request_close = asyncio.Event()
+    events: list[str] = []
+    producer = None
+    round_state = None
+    instance = SimpleNamespace(
+        system_prompt_builder=SimpleNamespace(remove_section=MagicMock()),
+        ability_manager=SimpleNamespace(get=lambda _: object()),
+        get_context_usage=lambda **_: {},
+    )
+    adapter = _dynamic_stream_adapter(monkeypatch, instance)
+    expert = expert_team.LocalExpert("a", "专家", "职责", object())
+    monkeypatch.setattr(expert_team, "scan_local_experts", AsyncMock(return_value={"a": expert}))
+    monkeypatch.setattr(expert_team, "_subagent_config", lambda *_: SimpleNamespace(rails=[]))
+    bind = AsyncMock(return_value=[])
+    monkeypatch.setattr(expert_team, "apply_extension_hot", bind)
+
+    async def blocked_plan(*_):
+        planner_started.set()
+        try:
+            await release_planner.wait()
+        except asyncio.CancelledError:
+            events.append("producer_aborted")
+            raise
+        return {"status": "ready", "graph": {"nodes": {"a": {"task": "处理", "label": "专家"}}, "edges": []}}
+
+    monkeypatch.setattr(expert_team, "plan_experts", blocked_plan)
+
+    async def attach_output():
+        return InteractionOutputStream(instance, await leases.attach())
+
+    async def send_input(_request):
+        nonlocal producer, round_state
+        round_state = adapter._dynamic_expert_rounds[sid]
+        producer = asyncio.create_task(round_state.compose("请专家处理"))
+        await planner_started.wait()
+        await leases.emit(SimpleNamespace(type="llm_output", payload={"content": "开始规划"}))
+
+    async def detach_output(token, *, abort_active_round):
+        assert await leases.detach(token)
+        assert abort_active_round is True
+        events.append("output_close")
+        producer.cancel()
+        await asyncio.gather(producer, return_exceptions=True)
+
+    instance.attach_output = attach_output
+    instance.send_input = send_input
+    instance.next_output = leases.next_item
+    instance.detach_output = detach_output
+    original_close = adapter._close_dynamic_expert_round
+
+    async def close_experts(session_id, *, expected=None):
+        if expected is not None:
+            events.append("expert_cleanup")
+        await original_close(session_id, expected=expected)
+
+    monkeypatch.setattr(adapter, "_close_dynamic_expert_round", close_experts)
+    request = _build_chat_send_request({"query": "请专家处理", "mode": "agent"}, sid)
+
+    async def consume():
+        async with aclosing(adapter.process_message_stream_impl(request, {"query": "请专家处理"})) as stream:
+            chunk = await anext(stream)
+            assert chunk.payload["event_type"] == "chat.delta"
+            first_chunk_seen.set()
+            if consumer_action == "cancel":
+                await anext(stream)
+            else:
+                await request_close.wait()
+
+    consumer = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(first_chunk_seen.wait(), timeout=1.0)
+        if consumer_action == "cancel":
+            consumer.cancel()
+        else:
+            request_close.set()
+        result = await asyncio.wait_for(asyncio.gather(consumer, return_exceptions=True), timeout=1.0)
+        if consumer_action == "cancel":
+            assert isinstance(result[0], asyncio.CancelledError)
+        else:
+            assert result == [None]
+        assert events == ["output_close", "producer_aborted", "expert_cleanup"]
+        assert producer.cancelled()
+        assert round_state._closed is True
+        assert sid not in adapter._dynamic_expert_rounds
+        assert not leases.has_consumer()
+        release_planner.set()
+        bind.assert_not_awaited()
+    finally:
+        # The red case blocks on the planning lock. Always unblock and drain
+        # both tasks so a failing assertion cannot hang pytest teardown.
+        request_close.set()
+        if producer is not None and not producer.done():
+            producer.cancel()
+        release_planner.set()
+        if producer is not None:
+            await asyncio.gather(producer, return_exceptions=True)
+        if not consumer.done():
+            consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+        await leases.shutdown()
+
+
+@pytest.mark.parametrize("hitl_pending", [False, True])
+@pytest.mark.asyncio
+async def test_completed_output_keeps_dynamic_experts_only_for_hitl(
+    monkeypatch: pytest.MonkeyPatch, hitl_pending: bool,
+) -> None:
+    """自然结束先关闭所属输出流，HITL 保留原轮次，普通完成回收。"""
+    from openjiuwen.harness.schema.interaction import InteractionOutputStream, OutputLeaseManager
+
+    sid = "dynamic-stream-complete"
+    leases = OutputLeaseManager()
+    rounds = []
+    instance = SimpleNamespace(
+        system_prompt_builder=SimpleNamespace(remove_section=MagicMock()),
+        get_context_usage=lambda **_: {},
+        detach_output=AsyncMock(),
+    )
+    adapter = _dynamic_stream_adapter(monkeypatch, instance)
+    original_expert_close = adapter._close_dynamic_expert_round
+
+    async def attach_output():
+        return InteractionOutputStream(instance, await leases.attach())
+
+    async def send_input(_request):
+        rounds.append(adapter._dynamic_expert_rounds[sid])
+        if hitl_pending:
+            chunk = SimpleNamespace(
+                type="chat.ask_user_question", payload={"request_id": "ask-1", "questions": []},
+            )
+        else:
+            chunk = SimpleNamespace(type="answer", payload={"output": "已完成"})
+        await leases.emit(chunk)
+        await leases.finish_current()
+
+    instance.attach_output = attach_output
+    instance.send_input = send_input
+    instance.next_output = leases.next_item
+    request = _build_chat_send_request({"query": "请专家处理", "mode": "agent"}, sid)
+    try:
+        chunks = [chunk async for chunk in adapter.process_message_stream_impl(request, {"query": "请专家处理"})]
+        assert chunks[-1].is_complete is True
+        assert not any(chunk.payload and chunk.payload.get("event_type") == "chat.error" for chunk in chunks)
+        assert len(rounds) == 1
+        if hitl_pending:
+            assert any(chunk.payload and chunk.payload.get("event_type") == "chat.ask_user_question" for chunk in chunks)
+            assert adapter._dynamic_expert_rounds[sid] is rounds[0]
+            assert rounds[0]._closed is False
+        else:
+            assert sid not in adapter._dynamic_expert_rounds
+            assert rounds[0]._closed is True
+        assert not leases.has_consumer()
+        instance.detach_output.assert_not_awaited()
+    finally:
+        await original_expert_close(sid)
+        await leases.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False])
+async def test_dynamic_confirmation_resumes_same_round_and_rejects_stale_answers(monkeypatch, streaming):
+    from openjiuwen.core.single_agent.interrupt.state import RESUME_USER_INPUT_KEY
+    from openjiuwen.harness.schema.interaction import InteractionOutputStream, OutputLeaseManager
+    from jiuwenswarm.server.runtime.agent_adapter.interface import JiuWenSwarm
+    from tests.unit_tests.agentserver.test_symphony_expert_confirmation import build_pending_fixture
+
+    fixture = await build_pending_fixture(monkeypatch)
+    sid = fixture.session.get_session_id()
+    instance = fixture.agent
+    instance._loop_session = fixture.session
+    instance.system_prompt_builder = SimpleNamespace(remove_section=MagicMock())
+    instance.get_context_usage = lambda **_: {}
+    leases = OutputLeaseManager()
+    adapter = _dynamic_stream_adapter(monkeypatch, instance)
+    adapter._dynamic_expert_rounds[sid] = fixture.round
+    sent = []
+
+    async def attach_output():
+        return InteractionOutputStream(instance, await leases.attach())
+
+    async def send_input(request):
+        sent.append(request)
+        assert adapter._dynamic_expert_rounds[sid] is fixture.round
+        assert not adapter._prepare_confirmation_resume(sid, params, answer_inputs())
+        assert set(request.inputs["query"].user_inputs) == {fixture.call.id}
+        # Actual ReAct clears its interruption state before calling the Rail.
+        fixture.session.update_state({INTERRUPTION_KEY: None})
+        fixture.ctx.extra[RESUME_USER_INPUT_KEY] = request.inputs["query"]
+        await fixture.rail.before_tool_call(fixture.ctx)
+        result = await fixture.tool.invoke({}, session=fixture.session)
+        assert result["status"] == "handed_off"
+        await leases.emit(SimpleNamespace(type="answer", payload={"output": "已完成"}))
+        await leases.finish_current()
+
+    instance.attach_output = attach_output
+    instance.send_input = send_input
+    instance.next_output = leases.next_item
+    instance.detach_output = AsyncMock()
+    params = {"query": "", "mode": "agent", "source": "confirm_interrupt",
+              "request_id": fixture.payload["request_id"], "answers": [{"selected_options": ["确认并开始"]}]}
+    def answer_inputs():
+        return {"query": JiuWenSwarm._build_interactive_input_from_answers(
+            params["request_id"], params["answers"], source="confirm_interrupt",
+        )}
+    async def dispatch(request, inputs):
+        if streaming:
+            return [chunk async for chunk in adapter.process_message_stream_impl(request, inputs)]
+        response = await adapter.process_message_impl(request, inputs)
+        return [SimpleNamespace(payload=response.payload, is_complete=response.ok)]
+    try:
+        for wrong_params, wrong_sid in [({**params, "request_id": "older-call"}, sid), (params, "other-session")]:
+            chunks = await dispatch(
+                _build_chat_send_request(wrong_params, wrong_sid), {"query": ""},
+            )
+            assert chunks[-1].payload["code"] == "INTERRUPT_EXPIRED"
+            assert adapter._dynamic_expert_rounds[sid] is fixture.round
+        request = _build_chat_send_request(params, sid)
+        chunks = await dispatch(request, answer_inputs())
+        assert chunks[-1].is_complete
+        assert sid not in adapter._dynamic_expert_rounds and fixture.round.closed
+        assert fixture.session.get_state("__symphony_expert_confirmation__") is None
+        repeated = await dispatch(request, answer_inputs())
+        assert repeated[-1].payload["code"] == "INTERRUPT_EXPIRED"
+        assert len(sent) == 1
+        fixture.scan.assert_awaited_once()
+        fixture.handoff.assert_awaited_once()
+        fixture.bind.assert_not_awaited()
+    finally:
+        await leases.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_late_expert_answer_cannot_confirm_new_round_reusing_provider_call_id(monkeypatch):
+    from jiuwenswarm.server.runtime.agent_adapter.interface import JiuWenSwarm
+    from tests.unit_tests.agentserver.test_symphony_expert_confirmation import build_pending_fixture, apply_answers
+
+    previous = await build_pending_fixture(monkeypatch)
+    previous_request_id = previous.payload["request_id"]
+    await previous.round.close()
+    current = await build_pending_fixture(monkeypatch)
+    sid = current.session.get_session_id()
+    assert previous.session.get_session_id() == sid
+    assert previous.call.id == current.call.id
+    current.agent._loop_session = current.session
+    adapter = _dynamic_stream_adapter(monkeypatch, current.agent)
+    adapter._dynamic_expert_rounds[sid] = current.round
+
+    assert current.payload["request_id"] != previous_request_id
+    answers = [{"selected_options": ["确认并开始"]}]
+    for old_id in (previous_request_id, current.call.id):
+        params = {"request_id": old_id, "answers": answers, "source": "confirm_interrupt", "mode": "agent"}
+        inputs = {"query": JiuWenSwarm._build_interactive_input_from_answers(old_id, answers, "confirm_interrupt")}
+        chunks = [chunk async for chunk in adapter.process_message_stream_impl(
+            _build_chat_send_request(params, sid), inputs,
+        )]
+        assert chunks[-1].payload["code"] == "INTERRUPT_EXPIRED"
+    assert not current.round._confirmation_submitted
+    assert current.round.pending_plan is not None
+    current.bind.assert_not_awaited()
+    result = await apply_answers(current, answers)
+    assert result["status"] == "handed_off"
+    current.handoff.assert_awaited_once()
+    current.bind.assert_not_awaited()
+    await current.round.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_invalidates_dynamic_plan_but_existing_control_confirms_still_resume(monkeypatch):
+    from tests.unit_tests.agentserver.test_symphony_expert_confirmation import build_pending_fixture
+
+    fixture = await build_pending_fixture(monkeypatch)
+    fixture.agent._loop_session = fixture.session
+    adapter = _dynamic_stream_adapter(monkeypatch, fixture.agent)
+    sid = fixture.session.get_session_id()
+    params = {"request_id": fixture.payload["request_id"]}
+    assert not adapter._prepare_confirmation_resume(sid, params, {})
+    request = _build_chat_send_request({
+        **params, "query": "", "source": "confirm_interrupt", "answers": [], "mode": "agent",
+    }, sid)
+    expired = await adapter.process_message_impl(request, {"query": ""})
+    assert not expired.ok and expired.payload["code"] == "INTERRUPT_EXPIRED"
+    state = fixture.session.get_state(INTERRUPTION_KEY)
+    params = {"request_id": fixture.call.id}
+    for name in ("switch_mode", "exit_plan_mode", "task_tool"):
+        state.interrupted_tools[fixture.call.id].tool_call.name = name
+        fixture.session.update_state({INTERRUPTION_KEY: state})
+        assert adapter._prepare_confirmation_resume(sid, params, {})
+    await fixture.round.close()
 
 
 @pytest.mark.asyncio

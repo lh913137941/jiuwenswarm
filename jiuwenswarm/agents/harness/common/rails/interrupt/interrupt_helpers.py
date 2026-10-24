@@ -926,6 +926,8 @@ def convert_interactions_to_ask_user_questions(state_outputs: list) -> list[dict
             request_id = confirmation_request_id(metadata) or request_id
             if source == "confirm_interrupt" and isinstance(metadata.get("expert_plan"), dict):
                 question_data["expert_plan"] = metadata["expert_plan"]
+            if source == "confirm_interrupt" and isinstance(metadata.get("expert_no_plan"), dict):
+                question_data["expert_no_plan"] = metadata["expert_no_plan"]
 
         payload = {
             "event_type": "chat.ask_user_question",
@@ -1064,6 +1066,7 @@ def _build_multi_questions(questions_data: list) -> list:
             "skillName",
             "authorization_scopes",
             "expert_plan",
+            "expert_no_plan",
         ):
             if key in q and q[key] is not None:
                 question_payload[key] = q[key]

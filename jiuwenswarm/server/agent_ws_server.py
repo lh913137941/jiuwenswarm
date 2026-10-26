@@ -970,9 +970,14 @@ def _inject_session_xiaoyi_routing(request: AgentRequest) -> None:
     injected = False
     for key in _XIAOYI_ROUTING_METADATA_KEYS:
         value = metadata.get(key)
-        if isinstance(value, str) and value.strip():
-            request_metadata.setdefault(key, value.strip())
-            injected = True
+        if not isinstance(value, str) or not value.strip():
+            continue
+        # 只有真正写入新字段才算「注入过」：请求里已存在的键（含空串）不覆盖，
+        # 也不应因此打上计费跳过标记（标记语义 = 本轮确实补过路由字段）
+        if key in request_metadata:
+            continue
+        request_metadata[key] = value.strip()
+        injected = True
     if injected:
         # 这些字段只用于渠道回发寻址：计费不能据此判定"本轮来自 xiaoyi 渠道"，
         # 否则桌面续轮会与桌面主进程重复上报同一 interaction（见 billing_client）。

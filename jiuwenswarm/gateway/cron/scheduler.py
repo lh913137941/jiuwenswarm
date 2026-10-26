@@ -1186,8 +1186,10 @@ class CronSchedulerService:
             finally:
                 state.finished_at = self._now_fn()
                 # 计费终态：每轮必收口；NEW 未派发/未登记的轮次由 report_terminal
-                # 登记守卫跳过。取消（删任务/编辑重载/进程关停）按 FINISH——对齐
-                # xiaoyi 渠道与桌面「用户主动停止按正常完成计费」语义。
+                # 登记守卫跳过。取消（删任务/编辑重载/进程关停）按 FINISH——这是 cron
+                # 的任务生命周期取消（运行可能已产出/消耗资源），不等同于聊天里用户
+                # 对回答点「停止」；聊天侧取消按 FAILED（interface_deep）。两者口径
+                # 刻意不同，不要再按「对齐 xiaoyi 渠道主动停止」的旧注释改回。
                 if billing_trace_id:
                     try:
                         billing_report_terminal(

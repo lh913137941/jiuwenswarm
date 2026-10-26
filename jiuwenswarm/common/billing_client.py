@@ -30,6 +30,8 @@ x-hag-trace-id = 裸核心段（``sessionId&interactionId短码``，≤45），�
   - 终态（FINISH/FAILED）在一轮 query 收口时发出；HITL 挂起不发
     （续跑收口时才发）；用户停止/中止（CancelledError）按 FAILED 收口，
     与桌面端 aborted→FAILED 同口径（主动停止不按正常完成计费）；
+    cron 调度轮次被取消仍按 FINISH（任务生命周期取消，见
+    gateway/cron/scheduler.py 的口径说明——与聊天停止刻意不同）；
   - 除 NEW 外全部 fire-and-forget + 失败重试 1 次——计费永不影响会话主路径。
 
 启用条件（缺一静默禁用——旧桌面/非桌面形态零影响）：
@@ -101,11 +103,15 @@ _CONTEXT_PREFIX_RE = re.compile(
 _LEADING_WORKSPACE_RE = re.compile(
     r"^<claw_workspace>[^\r\n]*</claw_workspace>\r?\n(?:【工作空间】[^\r\n]*\r?\n\r?\n)?"
 )
+# 兜底：指令后只有一个换行（无空行）时，上一条的可选分组不匹配，会残留
+# 「【工作空间】…」说明行；桌面 stripWorkspaceDirective 有同款残片兜底。
+_LEADING_WORKSPACE_RESIDUE_RE = re.compile(r"^【工作空间】[^\r\n]*\r?\n?")
 
 
 def _strip_injected_directives(query: str) -> str:
     """NEW 上报前剥离渠道注入段（工作空间/时间尾段 + 桌面 claw_context 前缀）。"""
     stripped = _LEADING_WORKSPACE_RE.sub("", query)
+    stripped = _LEADING_WORKSPACE_RESIDUE_RE.sub("", stripped)
     stripped = _WORKSPACE_DIRECTIVE_TAIL_RE.sub("", stripped)
     stripped = _CONTEXT_PREFIX_RE.sub("", stripped)
     return stripped.strip()

@@ -108,6 +108,10 @@ E2A_WIRE_SERVER_PUSH_KEY = "_jiuwenswarm_server_push"
 # Gateway 内部断连 cancel 来源；不得由 channel/user metadata 透传生成。
 E2A_INTERNAL_CANCEL_SOURCE_KEY = "_jiuwenswarm_cancel_source"
 E2A_CANCEL_SOURCE_CLIENT_DISCONNECT = "client_disconnect"
+# 服务端注入的「xiaoyi_* 仅用于回发寻址」标记：值必须与
+# billing_client.ROUTING_INJECTED_METADATA_KEY 一致（单测锁定）。若允许由 wire
+# 顶层 metadata 透传，客户端可自带该键跳过后端计费——因此视为内部键，入站即剥离。
+E2A_INTERNAL_ROUTING_INJECTED_KEY = "xiaoyi_routing_injected"
 
 # 仅用于编解码 / 队列语义，不得随业务 channel metadata 下发给 Message.metadata
 E2A_WIRE_INTERNAL_METADATA_KEYS: frozenset[str] = frozenset(
@@ -116,6 +120,7 @@ E2A_WIRE_INTERNAL_METADATA_KEYS: frozenset[str] = frozenset(
         E2A_WIRE_SERVER_PUSH_KEY,
         E2A_WIRE_LEGACY_AGENT_CHUNK_KEY,
         E2A_WIRE_LEGACY_AGENT_RESPONSE_KEY,
+        E2A_INTERNAL_ROUTING_INJECTED_KEY,
     }
 )
 

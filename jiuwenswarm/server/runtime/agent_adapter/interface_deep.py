@@ -495,6 +495,21 @@ def _report_xiaoyi_billing_terminal(
         logger.debug("[billing] 终态上报派发失败", exc_info=True)
 
 
+def _billing_terminal_failed(
+    *,
+    billing_failed: bool,
+    cancelled: bool = False,
+    error_text: bool = False,
+) -> bool:
+    """一轮 query 收口的计费终态判定（纯函数，流式/非流式共用）。
+
+    异常抛出、用户取消（CancelledError）、终端错误帧任一命中即 FAILED。
+    注意：cron 调度轮次的取消不走这里（scheduler 按 FINISH 收口——任务生命周期
+    取消与聊天「用户停止」语义不同，见 gateway/cron/scheduler.py 注释）。
+    """
+    return billing_failed or cancelled or error_text
+
+
 _PERSISTENT_CHECKPOINTER_LOCK: asyncio.Lock | None = None
 _PERSISTENT_CHECKPOINTER_LOCK_LOOP: asyncio.AbstractEventLoop | None = None
 _PERSISTENT_CHECKPOINTER_LOCK_INIT = threading.Lock()
@@ -10537,7 +10552,11 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # 终端错误帧经 error_text 判定；用户取消按 FAILED，与桌面 aborted 同口径）。
             _report_xiaoyi_billing_terminal(
                 invocation,
-                failed=_billing_failed or _billing_cancelled or bool(error_text),
+                failed=_billing_terminal_failed(
+                    billing_failed=_billing_failed,
+                    cancelled=_billing_cancelled,
+                    error_text=bool(error_text),
+                ),
                 hitl_pending=False,
                 # 本地会话/轮次 id：供桌面计费代理把 FINISH 的 consumedPoints 广播回气泡
                 local_session_id=getattr(request, "session_id", None),
@@ -11799,7 +11818,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # 与桌面 aborted→FAILED 同口径（主动停止不按正常完成计费）。
             _report_xiaoyi_billing_terminal(
                 invocation,
-                failed=_billing_failed or stream_consumer_cancelled,
+                failed=_billing_terminal_failed(
+                    billing_failed=_billing_failed,
+                    cancelled=stream_consumer_cancelled,
+                ),
                 hitl_pending=bool(emitted_ask_user_request_ids),
                 # 本地会话/轮次 id：供桌面计费代理把 FINISH 的 consumedPoints 广播回气泡
                 local_session_id=getattr(request, "session_id", None),

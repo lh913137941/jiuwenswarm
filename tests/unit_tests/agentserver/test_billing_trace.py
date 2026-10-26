@@ -293,6 +293,21 @@ class TestXiaoyiBillingClient:
 
         assert post.calls[0]["payload"]["query"] == "帮我写周报"
 
+    async def test_new_query_strips_workspace_residue_without_blank_line(self, monkeypatch) -> None:
+        """指令后没有空行时，残留的「【工作空间】…」说明行也要剥离（正则边界兜底）。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        injected = (
+            '<claw_workspace>{"path":"D:/proj"}</claw_workspace>\n'
+            "【工作空间】当前项目目录是 `D:/proj`。\n"
+            "帮我写周报"
+        )
+        assert billing_client.report_new(injected, "sess-1&abcd1234") is True
+        await _drain_report_tasks()
+
+        assert post.calls[0]["payload"]["query"] == "帮我写周报"
+
     async def test_new_query_keeps_context_like_text_in_body(self, monkeypatch) -> None:
         """正文中后置的 <claw_context> 不剥离（只剥开头注入段，不误伤用户原文）。"""
         post = _RecordingPost()

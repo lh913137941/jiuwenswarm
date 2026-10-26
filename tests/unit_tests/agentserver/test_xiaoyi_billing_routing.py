@@ -15,6 +15,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from jiuwenswarm.common.billing_client import ROUTING_INJECTED_METADATA_KEY
+from jiuwenswarm.common.e2a.constants import (
+    E2A_INTERNAL_ROUTING_INJECTED_KEY,
+    E2A_WIRE_INTERNAL_METADATA_KEYS,
+)
 from jiuwenswarm.server import agent_ws_server
 from jiuwenswarm.server.runtime.agent_adapter import interface_deep
 
@@ -81,7 +85,43 @@ class TestBillingSkipsInjectedRouting:
         assert report.calls == [("你好", "sess-1&abcd1234")]
 
 
+class TestRoutingMarkerTrustBoundary:
+    def test_marker_is_wire_internal_and_matches_billing_key(self) -> None:
+        """标记键必须被 E2A 入站过滤：客户端不能自带该键跳过后端计费。"""
+        assert E2A_INTERNAL_ROUTING_INJECTED_KEY == ROUTING_INJECTED_METADATA_KEY
+        assert ROUTING_INJECTED_METADATA_KEY in E2A_WIRE_INTERNAL_METADATA_KEYS
+
+
 class TestInjectRoutingMarker:
+    def test_existing_empty_keys_are_not_marked_as_injected(self, monkeypatch) -> None:
+        """请求里已有同名键（空串）时不算注入，也不打计费跳过标记。"""
+        from jiuwenswarm.server.runtime.session import session_metadata
+
+        monkeypatch.setattr(
+            session_metadata,
+            "get_session_metadata",
+            lambda _sid, cache_bust=False: {
+                "xiaoyi_session_id": "conv_x",
+                "xiaoyi_conversation_id": "conv_x",
+                "xiaoyi_root_session_id": "root_x",
+            },
+        )
+        request = SimpleNamespace(
+            metadata={
+                "xiaoyi_session_id": "",
+                "xiaoyi_conversation_id": "",
+                "xiaoyi_root_session_id": "",
+            },
+            session_id="desktop_1",
+        )
+        agent_ws_server._inject_session_xiaoyi_routing(request)
+
+        assert request.metadata == {
+            "xiaoyi_session_id": "",
+            "xiaoyi_conversation_id": "",
+            "xiaoyi_root_session_id": "",
+        }
+
     def test_injection_sets_marker_and_skips_task_id(self, monkeypatch) -> None:
         """真正注入回发字段时打标记；xiaoyi_task_id 仍不注入。"""
         from jiuwenswarm.server.runtime.session import session_metadata
@@ -208,3 +248,16 @@ class TestTerminalStatus:
         )
 
         assert report.calls == []
+
+    def test_terminal_failed_helper_covers_cancel_wiring(self) -> None:
+        """收口判定纯函数：异常 / 取消 / 终端错误帧任一命中即 FAILED。"""
+        assert interface_deep._billing_terminal_failed(billing_failed=False) is False
+        assert (
+            interface_deep._billing_terminal_failed(billing_failed=False, cancelled=True)
+            is True
+        )
+        assert (
+            interface_deep._billing_terminal_failed(billing_failed=False, error_text=True)
+            is True
+        )
+        assert interface_deep._billing_terminal_failed(billing_failed=True) is True

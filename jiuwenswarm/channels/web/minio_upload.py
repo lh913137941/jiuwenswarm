@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import sys
 import tempfile
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 
 def _max_upload_filename_bytes() -> int:
@@ -169,6 +172,13 @@ def upload_local_file_to_minio(
     if config.public_base_url:
         base = config.public_base_url.rstrip("/")
         url = f"{base}/{config.bucket}/{object_name}"
+        logger.warning(
+            "OBS_PUBLIC_BASE_URL is set — returning fixed public URL instead of "
+            "presigned URL. This requires the bucket '%s' to be publicly readable. "
+            "If attachments fail to load (e.g. HTTP 403), verify the bucket's "
+            "public-read policy or unset OBS_PUBLIC_BASE_URL to use presigned URLs.",
+            config.bucket,
+        )
     else:
         url = client.presigned_get_object(
             config.bucket,

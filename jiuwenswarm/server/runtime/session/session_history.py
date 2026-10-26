@@ -15,7 +15,8 @@ from jiuwenswarm.common.utils import get_agent_sessions_dir, is_persistable_sess
 
 
 logger = logging.getLogger(__name__)
-_FILE_LOCK = threading.Lock()
+# Writers can read during legacy append/bootstrap or truncation while holding this lock.
+_FILE_LOCK = threading.RLock()
 _WRITE_QUEUE: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(maxsize=20000)
 _WORKER_STARTED = False
 _WORKER_LOCK = threading.Lock()
@@ -217,7 +218,9 @@ def _read_history(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        with _FILE_LOCK:
+            text = path.read_text(encoding="utf-8")
+        data = json.loads(text)
     except Exception as exc:  # noqa: BLE001
         logger.warning("读取 history.json 失败，已忽略并重建: %s", exc)
         return []
@@ -232,7 +235,10 @@ def _read_history_jsonl(path: Path) -> list[dict[str, Any]]:
 
     records: list[dict[str, Any]] = []
     try:
-        for lineno, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        # Capture a complete write under the storage lock; parse the snapshot unlocked.
+        with _FILE_LOCK:
+            text = path.read_text(encoding="utf-8")
+        for lineno, raw_line in enumerate(text.splitlines(), start=1):
             line = raw_line.strip()
             if not line:
                 continue

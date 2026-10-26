@@ -209,3 +209,28 @@ async def test_raise_propagates_through_framework_chain(rail):
     ctx.extra["_streaming"] = True
     with pytest.raises(Exception, match="finish_reason"):
         await _model_call(agent, ctx)
+
+
+async def test_null_sentinel_chunk_does_not_mask_incomplete_stream(rail):
+    """llm_sse_patch 把「尚无 finish_reason」表示成字符串 "null"，不得视为已结束.
+
+    网关流式格式兼容分支给每个中间块的 finish_reason 填 "null"（truthy），
+    若按 truthy 判定，第一条流的第一个块就误判流已正常结束，流不完整检测
+    被整体架空（!7840 后 mf_002 依旧报红的根因）。
+    """
+    ctx = _make_ctx(_message(content="截断残句", finish_reason="null"))
+    await rail.before_model_call(ctx)
+    await rail.inspect_stream_chunk(ctx, SimpleNamespace(finish_reason="null"))
+    await rail.inspect_stream_chunk(ctx, SimpleNamespace(finish_reason="null"))
+    with pytest.raises(AbortError) as exc_info:
+        await rail.after_model_call(ctx)
+    assert "finish_reason" in str(exc_info.value.cause)
+
+
+async def test_null_sentinel_response_fallback_still_raises(rail):
+    """response.finish_reason 为 "null" 哨兵时，兜底判定同样不得视为已结束."""
+    ctx = _make_ctx(_message(content="截断残句", finish_reason="null"))
+    await rail.before_model_call(ctx)
+    with pytest.raises(AbortError) as exc_info:
+        await rail.after_model_call(ctx)
+    assert "finish_reason" in str(exc_info.value.cause)

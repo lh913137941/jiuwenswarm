@@ -6,13 +6,17 @@ import logging
 import asyncio
 import inspect
 import json
-import os
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable
 
 from jiuwenswarm.gateway.channel_manager.base import BaseChannel, ChannelMetadata, RobotMessageRouter
+from jiuwenswarm.gateway.channel_manager.im_platforms.whatsapp.bridge_launch import (
+    build_bridge_argv,
+    child_environment,
+    resolve_bridge_workdir,
+)
+from jiuwenswarm.gateway.channel_manager.spec import ChannelConfigError
 from jiuwenswarm.common.schema.message import EventType, Message, ReqMethod
 from jiuwenswarm.gateway.routing.keys import DeliveryTarget
 from jiuwenswarm.gateway.routing.session_sharing import RoutingTarget
@@ -159,21 +163,20 @@ class WhatsAppChannel(BaseChannel):
             logger.warning("WhatsAppChannel auto_start_bridge enabled but bridge_command is empty")
             return
 
-        workdir = (self.config.bridge_workdir or "").strip()
-        if not workdir:
-            workdir = str(Path(__file__).resolve().parents[1])
-
-        env = os.environ.copy()
-        for key, value in (self.config.bridge_env or {}).items():
-            env[str(key)] = str(value)
-
         try:
-            self._bridge_process = await asyncio.create_subprocess_shell(
-                command,
-                cwd=workdir,
+            argv = build_bridge_argv(command, resolve_executable=True)
+            workdir = resolve_bridge_workdir(self.config.bridge_workdir or "")
+            env = child_environment(self.config.bridge_env or {}, workdir)
+            self._bridge_process = await asyncio.create_subprocess_exec(
+                argv[0],
+                *argv[1:],
+                cwd=str(workdir),
                 env=env,
             )
             logger.info("WhatsApp bridge process started: pid=%s", self._bridge_process.pid)
+        except ChannelConfigError as exc:
+            logger.warning("WhatsApp bridge process rejected: %s", exc)
+            self._bridge_process = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("WhatsApp bridge process start failed: %s", exc)
             self._bridge_process = None

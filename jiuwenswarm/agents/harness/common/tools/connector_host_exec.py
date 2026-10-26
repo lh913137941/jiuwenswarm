@@ -15,10 +15,8 @@ from typing import Any, Optional
 
 from jiuwenswarm.common.connectors import command_uses_connector_cli
 from jiuwenswarm.common.host_shell import (
-    connector_wrap_posix,
     host_environ,
     host_shell_argv,
-    host_shell_wrap,
     run_host_subprocess,
 )
 
@@ -48,6 +46,7 @@ def install_connector_host_exec_hooks() -> None:
     from openjiuwen.core.common.exception.codes import StatusCode
     from openjiuwen.core.sys_operation.result import (
         ExecuteCmdChunkData,
+        ExecuteCmdResult,
         ExecuteCmdStreamResult,
     )
     from openjiuwen.extensions.sys_operation.sandbox.providers.jiuwenbox import (
@@ -79,9 +78,10 @@ def install_connector_host_exec_hooks() -> None:
         if command_should_host_exec(command):
             argv = host_shell_argv(command, shell_type=kwargs.get("shell_type"))
             if not argv:
-                argv = host_shell_wrap(
-                    command.strip(),
-                    posix=connector_wrap_posix(command, kwargs.get("shell_type")),
+                return _build_shell_error_result(
+                    "execute_cmd",
+                    "connector host command rejected",
+                    ExecuteCmdResult,
                 )
             return await _run_host(self, command, argv, cwd, timeout)
         return await original(

@@ -195,6 +195,36 @@ def test_cloud_versions_priority_and_source_switches(service):
     assert reordered["revision"] != cloud_state["revision"]
 
 
+def test_disabled_source_views_show_saved_rules_without_enforcing_them(service):
+    service.initialize_from_live()
+    service.replace_cloud_policy(1, {"tools": {"cloud_only": "deny"}})
+    service.update_settings({"policy_sources": [
+        {"id": "user", "enabled": False},
+        {"id": "cloud", "enabled": False},
+    ]})
+
+    snapshot = service.get_candidate(include_disabled_sources=True)
+    assert snapshot["local"]["permissions"]["tools"]["bash"] == "allow"
+    assert snapshot["cloud"]["permissions"]["tools"]["cloud_only"] == "deny"
+    assert snapshot["builtin"]["permissions"]["tools"]["builtin_tool"] == "deny"
+    assert snapshot["permissions"]["tools"] == {}
+    assert snapshot["permissions"]["composition"]["source_order"] == []
+    assert snapshot["source_errors"] == {}
+
+    service.update_local("tool", {"stored_only": "ask"})
+    edited = service.get_candidate(include_disabled_sources=True)
+    assert edited["local"]["permissions"]["tools"] == {"stored_only": "ask"}
+    assert edited["permissions"]["tools"] == {}
+
+    def broken_builtin():
+        raise ValueError("broken builtin")
+
+    service._builtin_reader = broken_builtin
+    unreadable = service.get_candidate(include_disabled_sources=True)
+    assert unreadable["source_errors"]["builtin"] == "broken builtin"
+    assert unreadable["permissions"]["tools"] == {}
+
+
 def test_local_module_replacement_and_invalid_input_do_not_touch_live(service):
     service.initialize_from_live()
     before = service.config_path.read_bytes()
@@ -251,6 +281,9 @@ def test_disabled_source_is_not_parsed_until_reenabled(service):
     service.update_settings({"policy_sources": [{"id": "user", "enabled": True}]})
     service.cloud_path.write_text("not: [valid", encoding="utf-8")
     assert service.get_candidate()["permissions"]["tools"] == {"bash": "allow"}
+    snapshot = service.get_candidate(include_disabled_sources=True)
+    assert snapshot["permissions"]["tools"] == {"bash": "allow"}
+    assert "cloud" in snapshot["source_errors"]
     with pytest.raises(Exception):
         service.update_settings({"policy_sources": [{"id": "cloud", "enabled": True}]})
     assert service.get_candidate()["permissions"]["tools"] == {"bash": "allow"}
@@ -295,6 +328,34 @@ def test_package_template_can_be_adopted_without_mutating_live(tmp_path):
     assert resolve_permission_profile_rules({"enabled": False, "rules": [delete_rule]})["rules"][0]["action"] == "allow"
     assert resolve_permission_profile_rules({"enabled": True, "rules": [delete_rule]})["rules"][0]["action"] == "ask"
     assert path.read_bytes() == template
+    assert any(rule.get("profile_actions") for rule in candidate["local"]["permissions"]["rules"])
+    assert service.publish_candidate()["config"]["permissions"]["rules"]
+
+
+def test_profile_actions_are_preserved_and_validated(service):
+    live = load_yaml_round_trip(service.config_path)
+    live["permissions"]["rules"][0]["profile_actions"] = {"full_access": "allow"}
+    dump_yaml_round_trip(service.config_path, live)
+    service.initialize_from_live()
+    assert service.get_candidate()["local"]["permissions"]["rules"][0]["profile_actions"] == {
+        "full_access": "allow",
+    }
+    with pytest.raises(ValueError, match="invalid profile_actions"):
+        service.update_local("command", [{
+            "id": "invalid-profile", "tools": ["bash"], "pattern": "bad *",
+            "action": "ask", "profile_actions": {"full_access": []},
+        }])
+
+
+def test_profile_actions_preserve_template_rule_and_reject_invalid_overrides():
+    rule = {
+        "id": "delete-files", "tools": ["shell"], "pattern": "rm *",
+        "action": "ask", "profile_actions": {"full_access": "allow"},
+    }
+    source = validate_source({"permissions": {"rules": [rule]}})
+    assert source["permissions"]["rules"][0]["profile_actions"] == {"full_access": "allow"}
+    with pytest.raises(ValueError, match="invalid profile_actions"):
+        validate_source({"permissions": {"rules": [{**rule, "profile_actions": {"full_access": "skip"}}]}})
 
 
 @pytest.mark.parametrize("profile_actions", [
@@ -305,7 +366,7 @@ def test_rule_profile_actions_rejects_invalid_values(profile_actions):
         "id": "delete", "tools": ["shell"], "pattern": "rm *", "action": "ask",
         "profile_actions": profile_actions,
     }]}}
-    with pytest.raises(ValueError, match="invalid rule profile_actions"):
+    with pytest.raises(ValueError, match="invalid profile_actions"):
         validate_source(source)
 
 
@@ -374,6 +435,47 @@ def test_composed_permanent_approval_stays_in_user_source(service):
     assert [item["id"] for item in service._read_yaml(service.local_path)["permissions"]["approval_overrides"]] == [
         "approved-1", "remembered",
     ]
+
+
+def test_legacy_edit_keeps_sandbox_retry_for_unchanged_network_axis(service):
+    live = load_yaml_round_trip(service.config_path)
+    live["sandbox"]["enabled"] = True
+    dump_yaml_round_trip(service.config_path, live)
+    service.initialize_from_live()
+    pending = service.update_local("network", {"pending.example": "deny"})
+    service.publish_candidate(expected_revision=pending["revision"])
+    service.record_apply(
+        pending["revision"], {"rail": "applied", "host_exit": "applied", "sandbox": "failed: unavailable"},
+        sandbox_retry={"network": True},
+    )
+
+    _, edited = service.edit_native(
+        lambda _settings, local: local["permissions"].setdefault("tools", {}).update({"bash": "ask"}),
+    )
+    assert edited["sandbox_retry"] == {"network": True}
+    assert service.get_candidate()["apply"]["sandbox_retry"] == {"network": True}
+
+
+def test_permanent_approval_does_not_mark_unfinished_sandbox_projection_applied(service):
+    live = load_yaml_round_trip(service.config_path)
+    live["sandbox"]["enabled"] = True
+    dump_yaml_round_trip(service.config_path, live)
+    service.initialize_from_live()
+    pending = service.update_local("network", {"pending.example": "deny"})
+    service.publish_candidate(expected_revision=pending["revision"])
+    service.record_apply(
+        pending["revision"], {"rail": "applied", "host_exit": "applied", "sandbox": "failed: unavailable"},
+        sandbox_retry={"network": True},
+    )
+
+    grant = {"id": "remembered", "tools": ["bash"], "match_type": "command",
+             "pattern": "safe *", "action": "allow"}
+    assert service.persist_user_approval(grant)
+    state = service.get_candidate()["apply"]
+    assert not state["applied"]
+    assert state["targets"]["sandbox"] == "pending"
+    assert state["sandbox_retry"] == {"network": True}
+    assert load_yaml_round_trip(service.config_path)["permissions"]["approval_overrides"][-1] == grant
 
 
 def test_composed_file_projection_accepts_read_deny_implied_exec_on_windows(tmp_path):

@@ -73,6 +73,9 @@ from jiuwenswarm.common.ws_diagnostics import (
 from jiuwenswarm.common.ws_limits import AGENT_WS_MAX_MESSAGE_BYTES
 from jiuwenswarm.extensions.hook_event import AgentServerHookEvents
 from jiuwenswarm.agents.harness.common.plugins.rail_manager import get_rail_manager
+from jiuwenswarm.agents.harness.common.plugins.rail_source_policy import (
+    assert_local_extension_peer,
+)
 from jiuwenswarm.agents.harness.common.rails.interrupt.interrupt_helpers import (
     is_interrupt_resume_payload,
 )
@@ -4420,7 +4423,8 @@ class AgentWebSocketServer:
         return session_id, expert_id
 
     async def _handle_experts_list(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
-        result = await self._expert_service.list_experts()
+        params = request.params if isinstance(request.params, dict) else {}
+        result = await self._expert_service.list_experts(source=params.get("source"))
         await self._send_expert_response(
             ws, request, send_lock, ok=result.ok, payload=result.payload
         )
@@ -5598,7 +5602,11 @@ class AgentWebSocketServer:
                 )
         elif request.req_method == ReqMethod.SANDBOX_RESTART:
             try:
-                payload = await self._restart_configured_sandboxes(request.params or {})
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    payload = await self._restart_configured_sandboxes(request.params or {})
                 resp = AgentResponse(request_id=request.request_id, channel_id=request.channel_id,
                                      ok=True, payload=payload, metadata=request.metadata)
             except Exception as exc:
@@ -5611,16 +5619,20 @@ class AgentWebSocketServer:
 
                 # The legacy switch must await readiness too; do not also enqueue
                 # its usual background apply, which could race a following update.
-                resp = dispatch_sandbox_config_request(request, apply_enabled=False)
-                if resp.ok:
-                    try:
-                        await _apply_sandbox_change("enabled", strict=True)
-                    except Exception as exc:
-                        resp = AgentResponse(
-                            request_id=request.request_id, channel_id=request.channel_id,
-                            ok=False, payload={"error": str(exc), "code": "SANDBOX_CONFIG_FAILED"},
-                            metadata=request.metadata,
-                        )
+                apply_lock = getattr(self, "_security_config_apply_lock", None)
+                if apply_lock is None:
+                    apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                async with apply_lock:
+                    resp = dispatch_sandbox_config_request(request, apply_enabled=False)
+                    if resp.ok:
+                        try:
+                            await _apply_sandbox_change("enabled", strict=True)
+                        except Exception as exc:
+                            resp = AgentResponse(
+                                request_id=request.request_id, channel_id=request.channel_id,
+                                ok=False, payload={"error": str(exc), "code": "SANDBOX_CONFIG_FAILED"},
+                                metadata=request.metadata,
+                            )
             else:
                 resp = dispatch_sandbox_config_request(request)
         wire = encode_agent_response_for_wire(resp, response_id=request.request_id)
@@ -5677,10 +5689,15 @@ class AgentWebSocketServer:
         restarted = 0
         # Finish old Windows ACL cleanup for every scope before installing any
         # replacement ACLs. Otherwise a later old instance can undo an earlier new one.
+        from jiuwenswarm.server.sandbox_lifecycle import cleanup_jiuwenbox_sandboxes
+
         for adapter in adapters:
             await adapter.apply_sandbox_runtime_patch(
                 runtime, files_changed=True, strict=True, prepare_only=True,
             )
+        # Include orphaned scopes/historical URLs after preparing active cards
+        # (which also disables host fallback), still before any new ACL exists.
+        await cleanup_jiuwenbox_sandboxes(reason="policy_changed", strict=True)
         failures = []
         for index, adapter in enumerate(adapters):
             try:
@@ -7528,10 +7545,15 @@ class AgentWebSocketServer:
                 validate_sandbox_files_runtime(get_sandbox_runtime().get("files"))
                 if sub == "status":
                     payload = {"runtime": get_sandbox_runtime()}
-                elif sub == "enable":
-                    payload = await self._handle_sandbox_enable(channel_id)
-                elif sub == "disable":
-                    payload = await self._handle_sandbox_disable(channel_id)
+                elif sub in {"enable", "disable"}:
+                    apply_lock = getattr(self, "_security_config_apply_lock", None)
+                    if apply_lock is None:
+                        apply_lock = self._security_config_apply_lock = asyncio.Lock()
+                    async with apply_lock:
+                        if sub == "enable":
+                            payload = await self._handle_sandbox_enable(channel_id)
+                        else:
+                            payload = await self._handle_sandbox_disable(channel_id)
                 elif sub == "exclude.add":
                     payload = await self._handle_sandbox_exclude_add(channel_id, params)
                 elif sub == "exclude.remove":
@@ -7728,26 +7750,35 @@ class AgentWebSocketServer:
 
         # 记录关闭前的端点用于回执 (external 模式下 runner 没拥有进程, 会是 None)。
         owned_endpoint = self._jiuwenbox_runner.get_owned_endpoint()
-        jiuwenbox_stopped = False
-        if owned_endpoint is not None:
-            try:
-                await self._jiuwenbox_runner.stop()
-                jiuwenbox_stopped = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "[AgentWebSocketServer] /sandbox disable: jiuwenbox stop failed: %s",
-                    exc,
-                )
-        else:
-            logger.debug(
-                "[AgentWebSocketServer] /sandbox disable: no owned jiuwenbox to stop "
-                "(external startup_mode or never started)"
+        from jiuwenswarm.server.sandbox_config_rpc import _teardown_registered_sandbox_sysops
+        from jiuwenswarm.server.sandbox_lifecycle import cleanup_jiuwenbox_sandboxes
+
+        _teardown_registered_sandbox_sysops()
+        stop_error = None
+        try:
+            # stop() also retires an already-exited owned process, whose live
+            # endpoint is None. External processes are never stopped by runner.
+            await self._jiuwenbox_runner.stop()
+        except Exception as stop_exc:  # noqa: BLE001
+            logger.warning(
+                "[AgentWebSocketServer] /sandbox disable: jiuwenbox stop failed: %s", stop_exc,
             )
+            stop_error = stop_exc
+        try:
+            # A stop failure must not skip DELETEs against a still-live service.
+            await cleanup_jiuwenbox_sandboxes(reason="disabled", strict=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[AgentWebSocketServer] /sandbox disable: cleanup failed: %s", exc,
+            )
+            raise
+        if stop_error is not None:
+            raise stop_error
 
         payload: dict[str, Any] = {
             "runtime": runtime,
             "agent_recreated": True,
-            "jiuwenbox_stopped": jiuwenbox_stopped,
+            "jiuwenbox_stopped": owned_endpoint is not None,
         }
         if owned_endpoint is not None:
             host, port = owned_endpoint
@@ -9002,15 +9033,12 @@ class AgentWebSocketServer:
     async def _handle_extensions_import(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """导入新的 Rail 扩展（文件夹结构）."""
         try:
+            assert_local_extension_peer(ws)
             params = request.params or {}
             folder_path = params.get("folder_path")
 
-            if not folder_path:
+            if not isinstance(folder_path, str) or not folder_path.strip():
                 raise ValueError("缺少 folder_path 参数")
-
-            source_path = Path(folder_path)
-            if not source_path.exists() or not source_path.is_dir():
-                raise ValueError(f"文件夹不存在或不是目录: {folder_path}")
 
             manager = get_rail_manager()
             extension = manager.import_extension(folder_path)
@@ -9037,6 +9065,7 @@ class AgentWebSocketServer:
     async def _handle_extensions_delete(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """删除 Rail 扩展."""
         try:
+            assert_local_extension_peer(ws)
             params = request.params or {}
             name = params.get("name")
 
@@ -9068,6 +9097,7 @@ class AgentWebSocketServer:
     async def _handle_extensions_toggle(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         """切换 Rail 扩展的启用状态，并触发热更新."""
         try:
+            assert_local_extension_peer(ws)
             params = request.params or {}
             name = params.get("name")
             enabled = params.get("enabled", False)

@@ -1,10 +1,9 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """专家包来源抽象与实现。
 
-上层（WS handler / 适配器）只经 ``get_expert_source()`` 拿 source，不感知仓库存在：
-``list()`` 返回列表元数据，``fetch(expert_id)`` 保证包在本地可用并返回包目录路径，
-之后仍走 ``DeepAgent.load_agent_template(本地路径)`` —— 正式仓库就绪后只需替换
-``HttpRepoExpertPackageSource``，其余代码零改动。
+目录与安装经 ``get_expert_source()`` 访问仓库；装载经
+``resolve_expert_package_dir()`` 优先使用已落盘的包，缺失时再下载。
+包就绪后仍走 ``DeepAgent.load_agent_template(本地路径)``。
 """
 
 from __future__ import annotations
@@ -78,7 +77,7 @@ def get_cached_expert_package_dir(expert_id: str) -> Path | None:
     """返回本地缓存的专家包目录（fetch 成功的落盘产物），无缓存返回 None。
 
     供重放/重挂路径缓存优先：重建时不重新 fetch、不被网络阻塞；
-    缓存只由 fetch 刷新（先清空再解压），用户主动 expert.load 即完成版本更新。
+    缓存只由 fetch 刷新（先清空再解压），用户主动 expert.install 即完成版本更新。
     本地目录 override（LocalDirExpertPackageSource）不落缓存，返回 None 时
     调用方回退 fetch（本地 fetch 无网络开销）。
     """
@@ -89,31 +88,24 @@ def get_cached_expert_package_dir(expert_id: str) -> Path | None:
 
 
 async def resolve_expert_package_dir(expert_id: str) -> Path:
-    """缓存优先解析专家包目录；缓存 miss 回退 fetch（本地源 fetch 无网络开销）。
+    """按本地目录、已下载缓存的顺序解析有效包；缺失时从来源链下载。
 
-    与 ``_apply_expert``（expert_capability.py）的 ``package_dir=None`` 兜底语义
-    对齐，供**同步装配点**的 async 调用方在进入同步段之前预取——专家团装配
-    ``assembly._apply_agent_group`` 只接受已就绪的本地路径，不能自持 await 。
+    expert.load、会话重放及专家团装配共用此路径。已落盘包损坏时保留校验错误，
+    不静默切换来源；显式安装/更新仍经 source.fetch 访问仓库。
     """
-    cached = get_cached_expert_package_dir(expert_id)
-    if cached is not None:
-        return cached
+    package_dir = None
     if os.environ.get(LOCAL_DIRS_ENV, "1") == "1":
-        # 本地源启用（默认）：LocalDir 源不落缓存，miss 回退 fetch 是常态
-        logger.info(
-            "[ExpertStore] expert package cache miss, fallback to source fetch "
-            "(local dirs enabled): %s",
-            expert_id,
-        )
-    else:
-        # 生产链路：缓存应已由 expert.load 落盘，miss 属异常态（缓存被清/损坏），
-        # 自动回退仓库下载可自愈，但必须留 warning 让异常可被发现
-        logger.warning(
-            "[ExpertStore] expert package cache unexpectedly missing, fallback "
-            "to repo fetch: %s（缓存本应已由 expert.load 落盘，请关注缓存目录健康）",
-            expert_id,
-        )
-    return await get_expert_source().fetch(expert_id)
+        try:
+            package_dir = await LocalDirExpertPackageSource().fetch(expert_id)
+        except ExpertNotFound:
+            pass
+    if package_dir is None:
+        package_dir = get_cached_expert_package_dir(expert_id)
+    if package_dir is None:
+        logger.info("[ExpertStore] expert package missing, fetching: %s", expert_id)
+        package_dir = await get_expert_source().fetch(expert_id)
+    validate_expert_package(package_dir)
+    return package_dir
 
 
 def validate_expert_package(package_dir: Path) -> list[str]:
@@ -427,7 +419,7 @@ def _extract_zip(content: bytes, target_dir: Path) -> None:
 
 
 class LocalDirExpertPackageSource:
-    """本地目录 dev override（仅 env JIUWEN_EXPERT_LOCAL_DIRS=1 时启用）。"""
+    """当前用户工作区下的本地专家包目录来源。"""
 
     def __init__(self, experts_dir: Path | None = None) -> None:
         self._experts_dir = experts_dir or get_agent_experts_dir()
@@ -451,10 +443,13 @@ class LocalDirExpertPackageSource:
         members: list[dict[str, str]] = []
         pkg_type = "agent"
         try:
-            validate_expert_package(package_dir)
             manifest = json.loads(
                 (package_dir / "manifest.json").read_text(encoding="utf-8")
             )
+            if not isinstance(manifest, dict):
+                raise InvalidExpertPackage("manifest.json 必须是 JSON 对象")
+            raw_metadata = manifest.get("metadata")
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
             if manifest.get("package_type") == "agent_group":
                 # 专家团：无 agentCard，展示名取顶层 name、描述取 leader 子包，
                 # 成员摘要供叠放头像/成员数展示
@@ -467,10 +462,12 @@ class LocalDirExpertPackageSource:
                 group = read_group_display(package_dir)
                 members = read_group_members(package_dir)
             else:
-                card = manifest.get("agentCard") or {}
-                metadata = manifest.get("metadata") or {}
-        except (InvalidExpertPackage, json.JSONDecodeError) as exc:
+                raw_card = manifest.get("agentCard")
+                card = raw_card if isinstance(raw_card, dict) else {}
+            validate_expert_package(package_dir)
+        except (InvalidExpertPackage, json.JSONDecodeError, OSError, UnicodeDecodeError, TypeError, ValueError) as exc:
             reason = str(exc)
+        raw_tags = metadata.get("tags")
         return ExpertSummary(
             id=str(card.get("id") or package_dir.name),
             name=str(card.get("name") or group.get("name") or package_dir.name),
@@ -478,7 +475,7 @@ class LocalDirExpertPackageSource:
             source="local",
             available=not reason,
             unavailable_reason=reason,
-            tags=list(metadata.get("tags") or []),
+            tags=[str(tag) for tag in raw_tags] if isinstance(raw_tags, list) else [],
             type=pkg_type,
             metadata=metadata,
             members=members,
@@ -496,8 +493,8 @@ class CachedExpertPackageSource(LocalDirExpertPackageSource):
 
     挂链尾（仓库之后）：
     - list：同名条目以仓库元数据为准（版本更新/下架信息新鲜），缓存只补充仓库没有的；
-    - fetch：先走仓库（下载产物本来就落 experts_cache，版本更新语义不变），
-      仓库 404（下架）或不可达时回退缓存目录——已下载专家仍可装载/重装；
+    - 安装 fetch：先走仓库，仓库 404（下架）或不可达时回退缓存目录；
+    - 装载 resolve_expert_package_dir：已落盘的有效包直接使用，不重复下载；
     - 列表只收校验通过的包：下载中断的残留目录（available=False）不进列表。
 
     缓存目录按用户动态解析（``get_expert_cache_dir()`` = 工作区下 experts_cache），
@@ -585,10 +582,12 @@ _default_source: ExpertPackageSource | None = None
 
 
 def get_expert_source() -> ExpertPackageSource:
-    """source 工厂：本地专家包目录源（默认启用，env 显式设 "0" 关闭）> 仓库 > 包缓存（experts_cache）。
+    """目录与安装的 source 工厂：本地目录 > 仓库 > 缓存。
 
     本地源默认开启：expert-manager 技能创建、用户导入的专家包落在本地 experts/
     目录，需此源才会进入 experts.list 从而可召唤；桌面端与 CLI 均默认生效。
+
+    装载已下载包时使用 resolve_expert_package_dir，不重复请求仓库。
     """
     global _default_source
     if _default_source is None:

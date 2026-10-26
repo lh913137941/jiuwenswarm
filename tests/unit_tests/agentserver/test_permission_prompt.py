@@ -198,6 +198,7 @@ def test_core_captured_file_list_and_risk_are_used_once():
         ("access", "访问"),
         ("edit", "写入"),
         ("list", "读取"),
+        ("delete", "删除"),
     ],
 )
 def test_file_actions_have_identical_display_with_and_without_metadata(
@@ -232,3 +233,78 @@ def test_file_actions_have_identical_display_with_and_without_metadata(
 def test_legacy_access_summary_uses_chinese_label():
     _, body = build_permission_prompt("custom_tool", {}, "access C:/资料/报告.txt")
     assert "访问 C:/资料/报告.txt" in body
+
+
+def test_batch_delete_card_shows_count_reason_and_delete_action():
+    message = (
+        "**助手想要在你的设备上运行程序指令**\n\n"
+        "工具 `bash` 需要授权才能执行\n\n"
+        "**风险等级：高风险**\n\n"
+        "> 默认仅授权当前对象；会话内记住仅对本会话有效，永久记住写入配置。"
+    )
+    metadata = {
+        "matched_rule": "tools.bash|del_guard:batch_delete",
+        "ask_title": "检测到批量删除，需要确认后才能执行",
+        "ask_reason": "本次操作将删除 5 个文件，达到阈值 2，需要确认",
+        "ask_risk_level": "高",
+        "file_operations": [
+            {"path": "C:/tmp/bd10_0.txt", "action": "delete", "source": "shlex"},
+            {"path": "C:/tmp/bd10_1.txt", "action": "delete", "source": "shlex"},
+        ],
+    }
+    title, body = build_permission_prompt(
+        "bash",
+        {"command": "rm -f C:/tmp/bd10_0.txt C:/tmp/bd10_1.txt", "shell_type": "bash"},
+        message,
+        metadata,
+    )
+    assert title == "检测到批量删除，需要确认后才能执行"
+    assert body.startswith("**检测到批量删除，需要确认后才能执行**")
+    assert "授权原因：本次操作将删除 5 个文件，达到阈值 2，需要确认" in body
+    assert "- 删除 C:/tmp/bd10\\_0.txt" in body
+    assert "- 删除 C:/tmp/bd10\\_1.txt" in body
+    assert "- 写入 " not in body
+    assert "授权说明" not in body
+    assert "默认仅授权当前对象" in body
+
+
+def test_batch_delete_card_keeps_write_actions():
+    metadata = {
+        "matched_rule": "tools.bash|del_guard:batch_delete",
+        "ask_title": "检测到批量删除，需要确认后才能执行",
+        "ask_reason": "本次操作将删除 1 个文件，达到阈值 1，需要确认",
+        "ask_risk_level": "高",
+        "file_operations": [
+            {"path": "C:/tmp/a.txt", "action": "delete", "source": "shlex"},
+            {"path": "C:/tmp/b.txt", "action": "write", "source": "shlex"},
+        ],
+    }
+    _, body = build_permission_prompt(
+        "bash",
+        {"command": "rm -f C:/tmp/a.txt && echo x > C:/tmp/b.txt", "shell_type": "bash"},
+        "",
+        metadata,
+    )
+    assert "- 删除 C:/tmp/a.txt" in body
+    assert "- 写入 C:/tmp/b.txt" in body
+
+
+def test_batch_delete_card_shows_reason_without_keyword_match():
+    metadata = {
+        "matched_rule": "tools.bash|del_guard:batch_delete",
+        "ask_title": "检测到批量删除，需要确认后才能执行",
+        "ask_reason": "批量删除文件数量已达上限，需要确认",
+        "ask_risk_level": "高",
+        "file_operations": [
+            {"path": "C:/tmp/a.txt", "action": "delete", "source": "shlex"},
+        ],
+    }
+    title, body = build_permission_prompt(
+        "bash",
+        {"command": "rm -f C:/tmp/a.txt", "shell_type": "bash"},
+        "",
+        metadata,
+    )
+    assert title == "检测到批量删除，需要确认后才能执行"
+    assert "授权原因：批量删除文件数量已达上限，需要确认" in body
+    assert "授权说明" not in body

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -152,13 +153,20 @@ def history_expert_identity_extra(session_id: str) -> dict[str, str]:
     return {"expert_id": "", "expert_type": "agent"}
 
 
-async def fetch_and_classify_expert(expert_id: str) -> tuple[str, Path, list[str]]:
-    """fetch + 校验 + 判型，返回 (expert_type, package_dir, warnings)。
+async def fetch_and_classify_expert(
+        expert_id: str, *, refresh: bool = False,
+) -> tuple[str, Path, list[str]]:
+    """就绪包解析 + 校验 + 判型，返回 (expert_type, package_dir, warnings)。
 
     异常原样上抛（ExpertNotFound / ExpertRepoUnavailable / InvalidExpertPackage），
-    由调用方映射错误码。供 expert.load 与 session.create 共用。
+    由调用方映射错误码。expert.load 与 session.create 优先读盘，
+    expert.install 传 refresh=True 经来源链刷新包。
     """
-    package_dir = await _expert_store.get_expert_source().fetch(expert_id)
+    package_dir = (
+        await _expert_store.get_expert_source().fetch(expert_id)
+        if refresh
+        else await _expert_store.resolve_expert_package_dir(expert_id)
+    )
     warnings = _expert_store.validate_expert_package(package_dir)
     return read_package_type(package_dir), package_dir, warnings
 
@@ -233,9 +241,24 @@ class ExpertService:
         self._agent_manager = agent_manager
         self._adapter_resolver = adapter_resolver
 
-    async def list_experts(self) -> ExpertOpResult:
+    async def list_experts(self, *, source: str | None = None) -> ExpertOpResult:
+        """默认列出全部来源；source=local 只扫描本地目录，不访问包仓库。"""
+        if source not in (None, "local"):
+            return ExpertOpResult(
+                ok=False, payload={"error": "不支持的专家来源", "code": "BAD_REQUEST"}
+            )
+        if source == "local" and os.environ.get(_expert_store.LOCAL_DIRS_ENV, "1") != "1":
+            return ExpertOpResult(
+                ok=False,
+                payload={"error": "本地专家目录来源已禁用", "code": "LOCAL_SOURCE_DISABLED"},
+            )
         try:
-            summaries = await _expert_store.get_expert_source().list()
+            expert_source = (
+                _expert_store.LocalDirExpertPackageSource()
+                if source == "local"
+                else _expert_store.get_expert_source()
+            )
+            summaries = await expert_source.list()
             return ExpertOpResult(
                 ok=True,
                 payload={"experts": [asdict(s) for s in summaries]},
@@ -254,9 +277,8 @@ class ExpertService:
     async def install_expert(self, *, expert_id: str) -> ExpertOpResult:
         """仅拉取资源到本地缓存（fetch + 校验 + 判型），不绑定任何会话。
 
-        供桌面端「召唤到我的专家（不对话）」用：与 expert.load 的首次 fetch
-        同路径（fetch_and_classify_expert），成功后包已落本地缓存，后续真正
-        load（会话绑定）时 fetch 直接命中缓存。
+        供桌面端「召唤到我的专家（不对话）」用：显式安装经来源链下载或更新，
+        成功后包已落本地缓存，后续 load（会话绑定）直接读盘。
         """
         if not expert_id:
             return ExpertOpResult(
@@ -264,7 +286,7 @@ class ExpertService:
                 payload={"error": "missing expert_id", "code": "BAD_REQUEST"},
             )
         try:
-            expert_type, _package_dir, warnings = await fetch_and_classify_expert(expert_id)
+            expert_type, _package_dir, warnings = await fetch_and_classify_expert(expert_id, refresh=True)
         except _expert_store.ExpertNotFound as exc:
             logger.warning("[ExpertService] expert.install 专家不存在: %s", exc)
             return ExpertOpResult(
@@ -295,7 +317,7 @@ class ExpertService:
             session_id: str,
             expert_id: str,
     ) -> ExpertOpResult:
-        """召唤/切换专家：先 fetch+校验，再按子适配器是否存在走 applied/pending。
+        """召唤/切换专家：先解析本地包（缺失则下载），再走 applied/pending。
 
         顺序是「先应用、成功后才写 metadata」——装载失败不留脏 expert_id。
         """
@@ -313,7 +335,7 @@ class ExpertService:
                 payload={"error": "missing session_id or expert_id", "code": "BAD_REQUEST"},
             )
 
-        # 1) fetch + 校验 + 判型（此步之前不写任何状态；以落盘 manifest 为准）
+        # 1) 本地包解析 + 校验 + 判型（此步之前不写状态；以落盘 manifest 为准）
         try:
             expert_type, package_dir, warnings = await fetch_and_classify_expert(expert_id)
         except _expert_store.ExpertNotFound as exc:

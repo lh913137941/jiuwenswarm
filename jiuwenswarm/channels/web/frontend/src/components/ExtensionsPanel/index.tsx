@@ -27,7 +27,10 @@ function translateImportError(rawMessage: string, t: TFunction): string {
 
   if (rawMessage === '缺少 folder_path 参数') return t('extensions.errors.missingFolderPath');
   if (rawMessage === '扩展文件夹必须包含 rail.py 文件') return t('extensions.errors.missingRailFile');
-  if (rawMessage === 'rail.py 验证失败') return t('extensions.errors.railValidationFailed');
+  if (rawMessage.includes('验证失败')) return t('extensions.errors.railValidationFailed');
+
+  const untrusted = rawMessage.match(/^扩展文件夹必须位于受信任导入目录内: (.+)$/);
+  if (untrusted) return t('extensions.errors.untrustedFolder', { roots: untrusted[1] });
 
   return rawMessage;
 }

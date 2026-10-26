@@ -131,3 +131,66 @@ async def test_dynamic_bootstrap_failure_is_returned_instead_of_success(startup)
     assert not response.ok
     assert "UAC cancelled" in response.payload["error"]
     await s.owner._checkpointer_warmup_task
+
+
+@pytest.mark.asyncio
+async def test_enable_waits_for_disable_config_stop_and_strict_cleanup(startup, monkeypatch):
+    from jiuwenswarm.server import sandbox_lifecycle
+    from jiuwenswarm.server.sandbox.jiuwenbox_runner import JiuwenBoxRunner
+
+    s = startup
+    await s.owner.start(listen_tcp=False)
+    s.runtime["enabled"] = True
+    stopping, stopped = asyncio.Event(), asyncio.Event()
+    cleaning, cleaned = asyncio.Event(), asyncio.Event()
+    events = []
+
+    async def stop():
+        events.append("stop")
+        stopping.set()
+        await stopped.wait()
+
+    async def cleanup(**kwargs):
+        assert kwargs == {"reason": "disabled", "strict": True}
+        events.append("strict-cleanup")
+        cleaning.set()
+        await cleaned.wait()
+        return 1
+
+    async def start():
+        assert cleaned.is_set()
+        events.append("start")
+
+    monkeypatch.setattr(JiuwenBoxRunner, "instance", lambda: SimpleNamespace(stop=stop))
+    monkeypatch.setattr(rpc, "_teardown_registered_sandbox_sysops", lambda: 1)
+    monkeypatch.setattr(sandbox_lifecycle, "cleanup_jiuwenbox_sandboxes", cleanup)
+    monkeypatch.setattr(rpc, "_internal_bootstrap", start)
+
+    def request(enabled):
+        return AgentRequest(
+            request_id=f"switch-{enabled}", channel_id="desktop", req_method=ReqMethod.SANDBOX_ENABLED_SET,
+            params={"enabled": enabled},
+        )
+
+    off = asyncio.create_task(s.owner._handle_sandbox_config(None, request(False), asyncio.Lock()))
+    await asyncio.wait_for(stopping.wait(), 1)
+    on = asyncio.create_task(s.owner._handle_sandbox_config(None, request(True), asyncio.Lock()))
+    try:
+        await asyncio.sleep(0)
+        assert not s.runtime["enabled"]
+        assert not on.done()
+        s.send.assert_not_awaited()
+        stopped.set()
+        await asyncio.wait_for(cleaning.wait(), 1)
+        assert not s.runtime["enabled"]
+        assert not on.done()
+        cleaned.set()
+        await asyncio.wait_for(asyncio.gather(off, on), 1)
+        assert s.runtime["enabled"]
+        assert events == ["stop", "strict-cleanup", "start"]
+        assert all(call.args[1].ok for call in s.send.await_args_list)
+    finally:
+        stopped.set()
+        cleaned.set()
+        await asyncio.gather(off, on, return_exceptions=True)
+        await s.owner._checkpointer_warmup_task

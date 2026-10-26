@@ -199,12 +199,21 @@ def validate_cron_model(raw: Any) -> str | None:
     value = str(raw).strip()
     if not value:
         return None
-    from jiuwenswarm.common.config import get_model_config, get_model_names
+    from jiuwenswarm.common.config import (
+        get_model_config,
+        get_model_names,
+        resolve_env_vars,
+    )
 
     entry = get_model_config(value)
     if entry is not None:
         mcc = entry.get("model_client_config") or {}
-        canonical = (mcc.get("model_name") or "").strip()
+        # get_model_config 命中时用「解析后的名字」匹配，但返回的是原始 entry
+        # （其 docstring 明确不解析环境变量）。config.yaml 模板里 model_name
+        # 常为 "${MODEL_NAME}" 占位符，若不解析就落库，cron job 记录会存进
+        # 原文，客户端回显错误且触发时匹配不到任何模型
+        # （cron_job_create_action_002_full_params 长红根因）。
+        canonical = resolve_env_vars((mcc.get("model_name") or "").strip()).strip()
         return canonical if canonical else value
     available = get_model_names()
     hint = ", ".join(available[:20]) if available else "(no models configured)"

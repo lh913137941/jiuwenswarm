@@ -84,9 +84,22 @@ class _RecordingPost:
         self.calls: list[dict] = []
         self._fail_times = fail_times
 
-    async def __call__(self, np_base: str, token: str, trace_id: str, payload: dict) -> bool:
+    async def __call__(
+        self,
+        np_base: str,
+        token: str,
+        trace_id: str,
+        payload: dict,
+        extra_headers: dict[str, str] | None = None,
+    ) -> bool:
         self.calls.append(
-            {"np_base": np_base, "token": token, "trace_id": trace_id, "payload": payload}
+            {
+                "np_base": np_base,
+                "token": token,
+                "trace_id": trace_id,
+                "payload": payload,
+                "extra_headers": extra_headers,
+            }
         )
         if self._fail_times > 0:
             self._fail_times -= 1
@@ -152,6 +165,51 @@ class TestXiaoyiBillingClient:
         await _drain_report_tasks()
         assert post.calls[-1]["payload"]["conversationStatus"] == "FAILED"
 
+    async def test_terminal_carries_local_ids_headers(self, monkeypatch) -> None:
+        """终态上报携带本地会话/轮次内部头（桌面计费代理据此广播气泡点数消耗）。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        billing_client.report_new("q", "50ec86ba&12")
+        billing_client.report_terminal(
+            "50ec86ba&12",
+            session_id="50ec86ba",
+            interaction_id="12",
+            ok=True,
+            local_session_id="desktop_1a176ccebb3",
+            local_run_id="50ec86ba-abcd&12&ae6e&0",
+        )
+        await _drain_report_tasks()
+
+        assert post.calls[-1]["extra_headers"] == {
+            billing_client.LOCAL_SESSION_HEADER: "desktop_1a176ccebb3",
+            billing_client.LOCAL_RUN_HEADER: "50ec86ba-abcd&12&ae6e&0",
+        }
+
+    async def test_terminal_without_local_ids_has_no_extra_headers(self, monkeypatch) -> None:
+        """未提供本地 id（cron/非桌面形态）或值非法：不带内部头，协议不变。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        billing_client.report_new("q", "sess-1&abcd1234")
+        billing_client.report_terminal(
+            "sess-1&abcd1234", session_id="sess-1", interaction_id="abcd1234", ok=True
+        )
+        await _drain_report_tasks()
+        assert post.calls[-1]["extra_headers"] == {}
+
+        billing_client.report_new("q2", "sess-2&efgh5678")
+        billing_client.report_terminal(
+            "sess-2&efgh5678",
+            session_id="sess-2",
+            interaction_id="efgh5678",
+            ok=True,
+            local_session_id="desktop\n注入",
+            local_run_id="run-1",
+        )
+        await _drain_report_tasks()
+        assert post.calls[-1]["extra_headers"] == {}
+
     async def test_new_query_strips_workspace_directive(self, monkeypatch) -> None:
         """渠道层 with_workspace_directive 拼入的 <claw_workspace> 尾段不进计费 query
         （受限档/完全访问档两种文案同剥离）。"""
@@ -191,6 +249,75 @@ class TestXiaoyiBillingClient:
         await _drain_report_tasks()
 
         assert post.calls[0]["payload"]["query"] == "现在几点了"
+
+    async def test_new_query_strips_claw_context_prefix(self, monkeypatch) -> None:
+        """桌面端注入的 <claw_context> 时间前缀不进计费 query（桌面续轮同口径）。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        injected = (
+            '<claw_context>{"timestamp":"2026-10-26 15:52:26"}</claw_context>\n\n测试上报'
+        )
+        assert billing_client.report_new(injected, "sess-1&abcd1234") is True
+        await _drain_report_tasks()
+
+        assert post.calls[0]["payload"]["query"] == "测试上报"
+
+    async def test_new_query_strips_skill_and_context_prefix(self, monkeypatch) -> None:
+        """带 /skill 前缀的 <claw_context> 同样剥离（与桌面 parseInjectedContext 同正则）。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        injected = (
+            '/skill docs <claw_context>{"timestamp":"2026-10-26 15:52:26"}</claw_context>'
+            "\n\n查一下接口"
+        )
+        assert billing_client.report_new(injected, "sess-1&abcd1234") is True
+        await _drain_report_tasks()
+
+        assert post.calls[0]["payload"]["query"] == "查一下接口"
+
+    async def test_new_query_strips_leading_workspace_then_context(self, monkeypatch) -> None:
+        """旧版前置 <claw_workspace> 与 <claw_context> 同时存在时依次剥离。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        injected = (
+            '<claw_workspace>{"path":"D:/proj"}</claw_workspace>\n'
+            "【工作空间】当前项目目录是 `D:/proj`。\n\n"
+            '<claw_context>{"timestamp":"2026-10-26 15:52:26"}</claw_context>\n\n'
+            "帮我写周报"
+        )
+        assert billing_client.report_new(injected, "sess-1&abcd1234") is True
+        await _drain_report_tasks()
+
+        assert post.calls[0]["payload"]["query"] == "帮我写周报"
+
+    async def test_new_query_strips_workspace_residue_without_blank_line(self, monkeypatch) -> None:
+        """指令后没有空行时，残留的「【工作空间】…」说明行也要剥离（正则边界兜底）。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        injected = (
+            '<claw_workspace>{"path":"D:/proj"}</claw_workspace>\n'
+            "【工作空间】当前项目目录是 `D:/proj`。\n"
+            "帮我写周报"
+        )
+        assert billing_client.report_new(injected, "sess-1&abcd1234") is True
+        await _drain_report_tasks()
+
+        assert post.calls[0]["payload"]["query"] == "帮我写周报"
+
+    async def test_new_query_keeps_context_like_text_in_body(self, monkeypatch) -> None:
+        """正文中后置的 <claw_context> 不剥离（只剥开头注入段，不误伤用户原文）。"""
+        post = _RecordingPost()
+        monkeypatch.setattr(billing_client, "_post_once", post)
+
+        text = '解释一下 <claw_context>{"a":1}</claw_context> 这个标签'
+        assert billing_client.report_new(text, "sess-1&abcd1234") is True
+        await _drain_report_tasks()
+
+        assert post.calls[0]["payload"]["query"] == text
 
     async def test_new_query_without_injection_untouched(self, monkeypatch) -> None:
         """无注入段的 query 原样透传（不误伤用户正文）。"""

@@ -589,7 +589,11 @@ def _build_context_processor_rail(config: dict[str, Any] | None) -> ContextProce
       section into ``ContextProcessorInput`` at spec-build time.
 
     Mirrors :func:`interface_deep._build_context_processor_rail`, which takes the
-    same shape (the ``react`` section itself).
+    same shape (the ``react`` section itself). That includes the
+    ``auto_compression`` merge: the dedicated compression-model config is folded
+    into all three passive compressor configs so leader / teammates compress
+    with ``auto_compression.model_name`` (empty → the member's own main model)
+    instead of silently falling back to the main model.
     """
     try:
         from typing import List, Tuple
@@ -606,17 +610,25 @@ def _build_context_processor_rail(config: dict[str, Any] | None) -> ContextProce
         if isinstance(offloader_cfg, dict) and offloader_cfg:
             user_processors.append(("MessageSummaryOffloader", offloader_cfg))
 
-        compressor_cfg = ctx_cfg.get("dialogue_compressor_config", {})
-        if isinstance(compressor_cfg, dict) and compressor_cfg:
-            user_processors.append(("DialogueCompressor", compressor_cfg))
+        auto_compression_cfg = ctx_cfg.get("auto_compression")
+        if not isinstance(auto_compression_cfg, dict):
+            auto_compression_cfg = None
 
-        current_round_cfg = ctx_cfg.get("current_round_compressor_config", {})
-        if isinstance(current_round_cfg, dict) and current_round_cfg:
-            user_processors.append(("CurrentRoundCompressor", current_round_cfg))
-
-        round_level_cfg = ctx_cfg.get("round_level_compressor_config", {})
-        if isinstance(round_level_cfg, dict) and round_level_cfg:
-            user_processors.append(("RoundLevelCompressor", round_level_cfg))
+        for compressor_key, compressor_cfg in (
+            ("DialogueCompressor", ctx_cfg.get("dialogue_compressor_config", {})),
+            ("CurrentRoundCompressor", ctx_cfg.get("current_round_compressor_config", {})),
+            ("RoundLevelCompressor", ctx_cfg.get("round_level_compressor_config", {})),
+        ):
+            if not isinstance(compressor_cfg, dict):
+                continue
+            if not compressor_cfg and auto_compression_cfg is None:
+                continue
+            merged_cfg = (
+                {**compressor_cfg, "auto_compression": auto_compression_cfg}
+                if auto_compression_cfg is not None
+                else compressor_cfg
+            )
+            user_processors.append((compressor_key, merged_cfg))
 
         reasoning_loop_cfg = ctx_cfg.get("reasoning_tool_loop_compact_config", {})
         if isinstance(reasoning_loop_cfg, dict) and reasoning_loop_cfg:
@@ -634,8 +646,9 @@ def _build_context_processor_rail(config: dict[str, Any] | None) -> ContextProce
         )
         logger.info(
             "[TeamRuntime] ContextProcessorRail created (preset=True), "
-            "user_processors=%s",
+            "user_processors=%s auto_compression=%s",
             [p[0] for p in user_processors] if user_processors else "none",
+            "enabled" if auto_compression_cfg is not None else "disabled",
         )
         return rail
     except Exception as exc:

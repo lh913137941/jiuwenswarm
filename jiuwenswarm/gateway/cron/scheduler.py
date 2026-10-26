@@ -30,7 +30,7 @@ from jiuwenswarm.gateway.cron.store import CronJobStore
 from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
 from jiuwenswarm.common.billing_client import (
     report_new as billing_report_new,
-    report_terminal as billing_report_terminal,
+    report_terminal_with_points as billing_report_terminal_with_points,
 )
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
 from jiuwenswarm.common.invocation_context.billing_trace import build_cron_trace_id
@@ -47,6 +47,9 @@ def _now_utc_ts() -> float:
 
 _WORKSPACE_OPEN = "<claw_workspace>"
 _WORKSPACE_CLOSE = "</claw_workspace>"
+
+# 终态计费上报任务（防 GC；含超时后仍在后台完成的任务；done_callback 移除）
+_BILLING_TASKS: set[asyncio.Task] = set()
 
 
 def _cron_billing_enabled() -> bool:
@@ -1185,21 +1188,31 @@ class CronSchedulerService:
                 state.error = str(exc)
             finally:
                 state.finished_at = self._now_fn()
-                # 计费终态：每轮必收口；NEW 未派发/未登记的轮次由 report_terminal
-                # 登记守卫跳过。取消（删任务/编辑重载/进程关停）按 FINISH——这是 cron
-                # 的任务生命周期取消（运行可能已产出/消耗资源），不等同于聊天里用户
-                # 对回答点「停止」；聊天侧取消按 FAILED（interface_deep）。两者口径
-                # 刻意不同，不要再按「对齐 xiaoyi 渠道主动停止」的旧注释改回。
+                # 计费终态：每轮必收口；NEW 未派发/未登记的轮次由终态上报的登记守卫跳过。
+                # 取消（删任务/编辑重载/进程关停）按 FINISH——这是 cron 的任务生命周期取消
+                # （运行可能已产出/消耗资源），不等同于聊天里用户对回答点「停止」；聊天侧
+                # 取消按 FAILED（interface_deep）。两者口径刻意不同，不要再按「对齐 xiaoyi
+                # 渠道主动停止」的旧注释改回。
+                # 收口时顺带取回 FINISH 响应的 consumedPoints 存进本轮状态（最终推送
+                # 带出给桌面展示）；最多等 5s，超时后上报仍在后台继续，不阻塞收尾。
                 if billing_trace_id:
-                    try:
-                        billing_report_terminal(
+                    billing_task = asyncio.create_task(
+                        billing_report_terminal_with_points(
                             billing_trace_id,
                             session_id=quote(job.id, safe=""),
                             interaction_id=quote(run_id, safe=""),
                             ok=state.status == "succeeded" or state.error == "cancelled",
+                        ),
+                        name=f"cron-billing-{run_id}",
+                    )
+                    _BILLING_TASKS.add(billing_task)
+                    billing_task.add_done_callback(_BILLING_TASKS.discard)
+                    try:
+                        state.consumed_points = await asyncio.wait_for(
+                            asyncio.shield(billing_task), timeout=5.0
                         )
-                    except Exception:  # noqa: BLE001 - 计费永不影响主路径
-                        logger.debug("[billing] cron 终态派发失败 run_id=%s", run_id, exc_info=True)
+                    except Exception:  # noqa: BLE001 - 计费展示不阻塞主路径（含超时）
+                        state.consumed_points = None
                 is_cancelled_ghost = state.error == "cancelled"
                 should_deliver_result = bool(state.result_text) and not is_cancelled_ghost  # noqa: F841  # pre-existing
                 # Ensure failed runs also produce result_text so push logic can deliver it.
@@ -1612,6 +1625,13 @@ class CronSchedulerService:
                 "exec_session_id": state.exec_session_id,
                 "is_placeholder": bool(is_placeholder),
                 "status": state.status,
+                # 本轮消耗点数（终态计费 FINISH 响应）：桌面渲染层据此展示「点数消耗」；
+                # 占位推送/未取得（FAILED/超时）不带
+                **(
+                    {"consumed_points": state.consumed_points}
+                    if state.consumed_points is not None and not is_placeholder
+                    else {}
+                ),
             },
         }
         channel_id = (job.targets or "").strip()

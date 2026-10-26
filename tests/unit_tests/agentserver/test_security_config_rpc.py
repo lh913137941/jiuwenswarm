@@ -24,8 +24,8 @@ class Manager:
         self.configs.append(deepcopy(config))
 
 
-def _package_sandbox_limits():
-    return load_yaml_round_trip(get_package_resources_dir() / "config.yaml")["sandbox"]["limits"]
+def _service_sandbox_limits(service):
+    return load_yaml_round_trip(service.config_path)["sandbox"]["limits"]
 
 
 @pytest.fixture
@@ -1172,7 +1172,7 @@ async def test_native_sandbox_facade_preserves_four_axes_and_reports_apply(servi
     )
     assert queried["config"] == {
         **config, "startup_mode": "internal",
-        "limits": _package_sandbox_limits(),
+        "limits": _service_sandbox_limits(service),
     }
     assert render.get_sandbox_files_axes() == files
     assert service.get_candidate()["apply"]["revision"] == source_revision
@@ -1213,6 +1213,7 @@ async def test_managed_legacy_sandbox_set_uses_native_facade(service, monkeypatc
     monkeypatch.setattr(config_module, "CONFIG_YAML_PATH", service.config_path)
     monkeypatch.setattr(render, "_config_dir", lambda: tmp_path)
     service.initialize_from_live()
+    initial_timeout = _service_sandbox_limits(service)["exec_timeout_seconds"]
 
     async def mode_change(_kind, *, strict=False):
         assert strict
@@ -1247,7 +1248,7 @@ async def test_managed_legacy_sandbox_set_uses_native_facade(service, monkeypatc
         restart_sandboxes=no_restart, service=service,
     )
     assert limits["applied"] and limits["limits"] == {
-        "max_file_mb": 12, "exec_timeout_seconds": _package_sandbox_limits()["exec_timeout_seconds"],
+        "max_file_mb": 12, "exec_timeout_seconds": initial_timeout,
     }
     queried_limits = await dispatch_managed_sandbox_request(
         ReqMethod.SANDBOX_LIMITS_GET, {}, restart_sandboxes=no_restart, service=service,

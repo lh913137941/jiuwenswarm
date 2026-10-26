@@ -212,11 +212,13 @@ async def _post_once(
     trace_id: str,
     payload: dict[str, Any],
     extra_headers: dict[str, str] | None = None,
-) -> bool:
-    """经 np://claw-billing 上报一次；2xx 返回 True，其余 False（响应码由代理透传上游）。
+) -> dict[str, Any] | None:
+    """经 np://claw-billing 上报一次；2xx 返回响应体（解析失败回空 dict），其余 None。
 
-    extra_headers 仅用于终态上报携带本地会话/轮次 id（桌面计费代理解析 FINISH 响应后
-    广播「点数消耗」）；代理侧会在转发上游前剥离这些内部头。
+    响应体透传上游 fulfillment 的 JSON（FINISH 携带顶层 consumedPoints，
+    见桌面 billing-client.ts 同字段解析）。extra_headers 仅用于终态上报携带本地
+    会话/轮次 id（桌面计费代理解析 FINISH 响应后广播「点数消耗」）；代理侧会在
+    转发上游前剥离这些内部头。
     """
     import httpx  # 延迟导入：非桌面形态零依赖开销
 
@@ -236,7 +238,31 @@ async def _post_once(
                 **(extra_headers or {}),
             },
         )
-        return 200 <= resp.status_code < 300
+        if not 200 <= resp.status_code < 300:
+            return None
+        try:
+            body = resp.json()
+        except Exception:  # noqa: BLE001 - 非 JSON 响应按「成功但无字段」处理
+            return {}
+        return body if isinstance(body, dict) else {}
+
+
+def _extract_consumed_points(body: dict[str, Any]) -> float | None:
+    """FINISH 响应里的本轮消耗点数（顶层 consumedPoints，兼容旧契约 data.consumedPoints）。
+
+    非数值/布尔/负数一律 None——宁可缺展示也不显示错数。
+    """
+    value = body.get("consumedPoints")
+    if value is None:
+        data = body.get("data")
+        if isinstance(data, dict):
+            value = data.get("consumedPoints")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if number != number or number in (float("inf"), float("-inf")) or number < 0:  # NaN/inf/负数
+        return None
+    return number
 
 
 def _local_header_value(value: str | None) -> str | None:
@@ -275,8 +301,8 @@ async def _run_report(
     tag = f"[billing] status={status} traceid={trace_id}"
     for attempt in (1, 2):
         try:
-            ok = await _post_once(np_base, token, trace_id, payload, extra_headers)
-            if ok:
+            body = await _post_once(np_base, token, trace_id, payload, extra_headers)
+            if body is not None:
                 logger.info("%s 上报成功", tag)
                 return
             logger.info("%s 上游非 2xx%s", tag, "，重试一次" if attempt == 1 else "（重试后仍失败）")
@@ -377,11 +403,59 @@ def reset_xiaoyi_billing_registry() -> None:
     _new_reported.clear()
 
 
+async def report_terminal_with_points(
+    trace_id: str,
+    *,
+    session_id: str,
+    interaction_id: str,
+    ok: bool,
+) -> float | None:
+    """上报终态并返回本轮消耗点数（FINISH 响应顶层 consumedPoints），无法取得返回 None。
+
+    与 report_terminal 同协议、同守卫（未登记 NEW 的轮次不发），差别只在调用方
+    需要拿到服务端响应：gateway cron 调度器把该值并入最终推送，桌面渲染层才能
+    在定时任务会话里展示「点数消耗」。失败重试 1 次；任何失败只记日志并返回
+    None——计费结果已在服务端落账，展示缺省不影响主路径。
+    """
+    if not trace_id or not xiaoyi_billing_enabled():
+        return None
+    if not has_reported_new(trace_id):
+        return None
+    cfg = _billing_config()
+    if cfg is None:
+        return None
+    np_base, token, uid, device_id = cfg
+    status = "FINISH" if ok else "FAILED"
+    payload = _build_status_body(
+        status,
+        uid=uid,
+        device_id=device_id,
+        session_id=session_id,
+        interaction_id=interaction_id,
+    )
+    tag = f"[billing] status={status} traceid={trace_id}"
+    for attempt in (1, 2):
+        try:
+            body = await _post_once(np_base, token, trace_id, payload)
+            if body is not None:
+                points = _extract_consumed_points(body) if status == "FINISH" else None
+                logger.info("%s 上报成功 consumedPoints=%s", tag, points if points is not None else "-")
+                return points
+            logger.info("%s 上游非 2xx%s", tag, "，重试一次" if attempt == 1 else "（重试后仍失败）")
+        except Exception as exc:  # noqa: BLE001
+            logger.info("%s 上报异常%s: %s", tag, "，重试一次" if attempt == 1 else "（重试后仍失败）", exc)
+        if attempt == 1:
+            await asyncio.sleep(1)
+    logger.warning("%s 上报最终失败（本轮计费可能丢失）", tag)
+    return None
+
+
 __all__ = [
     "ROUTING_INJECTED_METADATA_KEY",
     "has_reported_new",
     "report_new",
     "report_terminal",
+    "report_terminal_with_points",
     "reset_xiaoyi_billing_registry",
     "xiaoyi_billing_enabled",
 ]

@@ -181,6 +181,7 @@ from jiuwenswarm.common.tool_ownership import mark_stateless, register_tool, unr
 from jiuwenswarm.server.hooks.user_hook_rail import UserHookRail
 from jiuwenswarm.common.invocation_context.model_trace import TraceAwareModel
 from jiuwenswarm.common.billing_client import (
+    ROUTING_INJECTED_METADATA_KEY,
     report_new as billing_report_new,
     report_terminal as billing_report_terminal,
 )
@@ -430,11 +431,16 @@ def _maybe_report_xiaoyi_billing_new(request: Any, query: str, invocation: Any) 
     HITL 续跑同 core 不重复）。非 xiaoyi 渠道静默跳过——桌面对话与 cron 手动执行
     由桌面侧计费，gateway 调度 cron（channel_id=__cron__）由 scheduler._run_agent
     计费（同 common/billing_client.py 管道），本函数均不重复上报。
+    桌面端在手机话题里续发时注入的回发寻址字段（带 ROUTING_INJECTED_METADATA_KEY
+    标记）同样跳过：那一轮由桌面主进程计费，后端再报会让同一 interaction 出现
+    两次终态（后到的 consumedPoints=0，气泡与账单金额不一致）。
     计费永不影响会话主路径（任何异常仅记日志）。
     """
     try:
         channel_id = str(getattr(request, "channel_id", "") or "").strip().lower()
         metadata = request.metadata if isinstance(request.metadata, dict) else {}
+        if metadata.get(ROUTING_INJECTED_METADATA_KEY):
+            return
         is_xiaoyi = (
             channel_id == "xiaoyi"
             or bool(metadata.get("xiaoyi_session_id"))
@@ -456,13 +462,19 @@ def _report_xiaoyi_billing_terminal(
     *,
     failed: bool,
     hitl_pending: bool,
+    local_session_id: str | None = None,
+    local_run_id: str | None = None,
 ) -> None:
     """xiaoyi 渠道计费的终态上报（FINISH/FAILED；fire-and-forget，不阻塞流收口）。
 
     守卫：HITL 挂起（等用户输入，语义未终结）跳过——续跑复用同 task_id（同 core），
     终态在续跑收口时发出；未上报过 NEW 的轮次（非 xiaoyi 渠道/早退/被禁用）
     由 billing_client.report_terminal 的登记守卫拦截，不发 orphan 终态。
-    用户停止/中止（CancelledError）按既有计费语义视为正常完成（FINISH）。
+    用户停止/中止（CancelledError）按 FAILED 收口（与桌面 aborted→FAILED 同口径）。
+
+    local_session_id / local_run_id：桌面本地会话与轮次 id（手机入站轮次同样有），
+    随内部头上送计费代理，代理从 FINISH 响应里取 consumedPoints 广播回渲染层，
+    让桌面对话也能展示「点数消耗」。
     """
     try:
         if hitl_pending:
@@ -476,6 +488,8 @@ def _report_xiaoyi_billing_terminal(
             session_id=str(getattr(trace, "conversation_id", "") or ""),
             interaction_id=str(getattr(trace, "interaction_id", "") or ""),
             ok=not failed,
+            local_session_id=local_session_id,
+            local_run_id=local_run_id,
         )
     except Exception:  # noqa: BLE001 - 计费永不影响会话主路径
         logger.debug("[billing] 终态上报派发失败", exc_info=True)
@@ -10349,8 +10363,10 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
         interaction_stream = None
         interaction_stream_abort = True
         dynamic_expert_round = None
-        # 计费终态判定标记：异常抛出路径置真（终端错误帧由 error_text 兜底判定）
+        # 计费终态判定标记：异常抛出路径置真（终端错误帧由 error_text 兜底判定）；
+        # 用户取消（CancelledError）另记——终态按 FAILED 上报，与桌面 aborted→FAILED 同口径
         _billing_failed = False
+        _billing_cancelled = False
         # invocation 在 try 内（build_invocation_context 处）才赋值；finally 的计费
         # 终态上报需要它——提前置 None 防 UnboundLocalError 掩盖原始异常
         invocation: Any = None
@@ -10505,6 +10521,7 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
                             collected_content.append(text)
             interaction_stream_abort = False
         except asyncio.CancelledError:
+            _billing_cancelled = True
             logger.info(
                 "[JiuWenSwarmDeepAdapter] Agent 任务被取消: request_id=%s session_id=%s",
                 request.request_id,
@@ -10517,11 +10534,14 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             raise
         finally:
             # xiaoyi 渠道计费：上报终态 FINISH/FAILED（非流式同语义；
-            # CancelledError 按正常完成 FINISH；终端错误帧经 error_text 判定）。
+            # 终端错误帧经 error_text 判定；用户取消按 FAILED，与桌面 aborted 同口径）。
             _report_xiaoyi_billing_terminal(
                 invocation,
-                failed=_billing_failed or bool(error_text),
+                failed=_billing_failed or _billing_cancelled or bool(error_text),
                 hitl_pending=False,
+                # 本地会话/轮次 id：供桌面计费代理把 FINISH 的 consumedPoints 广播回气泡
+                local_session_id=getattr(request, "session_id", None),
+                local_run_id=getattr(request, "request_id", None),
             )
             close_agent_run_span(_run_span, session_id=session_id)
             if image_files_token is not None:
@@ -11775,11 +11795,15 @@ class JiuWenSwarmDeepAdapter(ExpertCapabilityMixin):
             # fulfillment task/status/update）。
             # HITL 挂起等用户输入（ask_user 已发出）不判终态——续跑复用同
             # interaction_id/task_id（同 core），终态在续跑收口时发出。
-            # 用户停止/中止（CancelledError）按既有计费语义视为正常完成（FINISH）。
+            # 用户停止/中止（CancelledError，stream_consumer_cancelled）按 FAILED 收口，
+            # 与桌面 aborted→FAILED 同口径（主动停止不按正常完成计费）。
             _report_xiaoyi_billing_terminal(
                 invocation,
-                failed=_billing_failed,
+                failed=_billing_failed or stream_consumer_cancelled,
                 hitl_pending=bool(emitted_ask_user_request_ids),
+                # 本地会话/轮次 id：供桌面计费代理把 FINISH 的 consumedPoints 广播回气泡
+                local_session_id=getattr(request, "session_id", None),
+                local_run_id=getattr(request, "request_id", None),
             )
             close_agent_run_span(_run_span, session_id=session_id)
             if _debug_logger is not None:

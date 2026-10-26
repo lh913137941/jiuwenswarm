@@ -27,6 +27,7 @@ from jiuwenswarm.agents.harness.common.tools.xiaoyi_phone_tools.device_command_m
 )
 from jiuwenswarm.common.device_rpc.models import DeviceCommandResponse
 from jiuwenswarm.common.gui_rpc.models import GuiRpcResponse
+from jiuwenswarm.common.billing_client import ROUTING_INJECTED_METADATA_KEY
 from jiuwenswarm.server.gateway_push.wire import build_server_push_wire
 from jiuwenswarm.server.ws_send import send_wire_payload
 from jiuwenswarm.server.e2a_transports import (
@@ -942,6 +943,9 @@ def _inject_session_xiaoyi_routing(request: AgentRequest) -> None:
     不注入 ``xiaoyi_task_id``：磁盘上的是上一轮已结束的手机任务。下一轮手机
     发言若读到这份缓存，send_file 会挂到已结束的 task，产物前 flush 刷空。
     手机入站自带 taskId；请求里已有 ``xiaoyi_session_id`` 时直接返回。
+
+    真正注入时额外写入 ``ROUTING_INJECTED_METADATA_KEY``：注入字段只用于回发寻址，
+    计费侧据此跳过（桌面续轮由桌面主进程申报，后端不得重复上报同一 interaction）。
     """
     request_metadata = request.metadata
     if not isinstance(request_metadata, dict):
@@ -960,10 +964,19 @@ def _inject_session_xiaoyi_routing(request: AgentRequest) -> None:
         return
     if not isinstance(metadata, dict):
         return
+    injected = False
     for key in _XIAOYI_ROUTING_METADATA_KEYS:
         value = metadata.get(key)
         if isinstance(value, str) and value.strip():
             request_metadata.setdefault(key, value.strip())
+            injected = True
+    if injected:
+        # 这些字段只用于渠道回发寻址：计费不能据此判定"本轮来自 xiaoyi 渠道"，
+        # 否则桌面续轮会与桌面主进程重复上报同一 interaction（见 billing_client）。
+        # 请求自带 xiaoyi_task_id 说明是真实手机入站（本函数只补 session/conversation/
+        # root 路由字段），仍由后端计费——此时不打标记。
+        if not request_metadata.get("xiaoyi_task_id"):
+            request_metadata[ROUTING_INJECTED_METADATA_KEY] = True
 
 
 def _harness_error_code(exc: BaseException) -> str:

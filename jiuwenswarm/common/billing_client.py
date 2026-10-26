@@ -19,8 +19,8 @@ fulfillment 服务（与模型访问 np://claw-model 同一套「鉴权收拢主
   - FINISH/FAILED 携带 sessionId/interactionId，不带 query
   - endpoint.device 固定字段照抄桌面 buildEndpointDevice（服务端校验以该形态为准）
 NEW 的 query 上报前剥离渠道注入段（_strip_injected_directives：<claw_workspace>
-尾段），与桌面 ReportConversations sanitizeReportQuery 同口径——工作空间路径
-不随计费接口出网。
+尾段、桌面端 <claw_context> 前缀），与桌面 ReportConversations
+sanitizeReportQuery 同口径——工作空间路径与协议注入段不随计费接口出网。
 
 x-hag-trace-id = 裸核心段（``sessionId&interactionId短码``，≤45），与本轮全部
 模型调用的 x-hag-trace-id 完全同值（TraceAwareModel 经 invocation context 注入）。
@@ -28,7 +28,8 @@ x-hag-trace-id = 裸核心段（``sessionId&interactionId短码``，≤45），�
 生命周期语义（对齐桌面条目）：
   - NEW 每 core 只发一次（HITL 续跑同 core 不重复）；
   - 终态（FINISH/FAILED）在一轮 query 收口时发出；HITL 挂起不发
-    （续跑收口时才发）；CancelledError 按 FINISH（用户主动停止按正常完成计费）；
+    （续跑收口时才发）；用户停止/中止（CancelledError）按 FAILED 收口，
+    与桌面端 aborted→FAILED 同口径（主动停止不按正常完成计费）；
   - 除 NEW 外全部 fire-and-forget + 失败重试 1 次——计费永不影响会话主路径。
 
 启用条件（缺一静默禁用——旧桌面/非桌面形态零影响）：
@@ -55,6 +56,20 @@ logger = logging.getLogger(__name__)
 _STATUS_PATH = "/fulfillment/v1/fulfillments/celia/task/status/update"
 _REQUEST_TIMEOUT_SECONDS = 15.0
 
+# 桌面端在手机发起的话题里续发消息时，agent_ws_server._inject_session_xiaoyi_routing
+# 会把会话里的 xiaoyi_* 回发寻址字段注入 request.metadata。这些字段只用于渠道回发，
+# 不能当成"本轮来自 xiaoyi 渠道"的计费信号——桌面续轮由桌面主进程申报计费，后端再报
+# 一次同一 interaction 会双重上报（后到的终态返回 consumedPoints=0，气泡与账单不一致）。
+# 打此标记的请求由 interface_deep._maybe_report_xiaoyi_billing_new 跳过。
+ROUTING_INJECTED_METADATA_KEY = "xiaoyi_routing_injected"
+
+# 终态上报携带的本地会话/轮次 id：仅本机计费代理（BillingProxy）使用，转发上游前剥离。
+# 手机入站轮次由后端计费、不经过桌面 BillingService；代理解析 FINISH 响应里的
+# consumedPoints 后按这两个 id 广播渲染层「点数消耗」，让桌面对话也能展示。
+LOCAL_SESSION_HEADER = "x-claw-local-session"
+LOCAL_RUN_HEADER = "x-claw-local-run"
+_LOCAL_HEADER_VALUE_MAX = 200
+
 # NEW 去重注册表：core → 最近活跃时间戳。TTL 2h + LRU 上限 2048（防泄漏；
 # 终态不驱逐——HITL 续跑同 core 仍属同一轮，不重复 NEW）。
 _REGISTRY_TTL_SECONDS = 2 * 3600
@@ -68,18 +83,32 @@ _REPORT_TASKS: set[asyncio.Task] = set()
 # 在手机端选择工作空间时拼入的 <claw_workspace> + 【工作空间】指令尾段不进计费上报——
 # 工作空间路径不随计费接口出网，且与桌面侧同口径（BillingService.report 经
 # restoreVisibleUserText 剥离 claw_context/claw_workspace/claw_cron_create 注入段；
-# 手机端不产生 claw_context，本侧注入源即该尾段及未选工作空间时的 <claw_time> 时间尾段）。
+# 手机端不产生 claw_context，但桌面端在手机话题里续发时会带上，因此这里也按桌面口径
+# 剥离开头的 <claw_context> 前缀）。
 _WORKSPACE_DIRECTIVE_TAIL_RE = re.compile(
     r"\s*(?:"
     r"<claw_workspace>[^\r\n]*</claw_workspace>\r?\n【工作空间】"
     r"|<claw_time>[^\r\n]*</claw_time>\r?\n【当前时间】"
     r")[^\r\n]*\s*$"
 )
+# 桌面端注入的消息前缀：可选的 /skill 串 + <claw_context>…</claw_context> + 空行。
+# 与桌面 core/chat/message-context.ts parseInjectedContext 的正则同口径。
+_CONTEXT_PREFIX_RE = re.compile(
+    r"^(?:/skill\s+[^\s]+(?:\s+/skill\s+[^\s]+)*\s+)?"
+    r"<claw_context>[^\r\n]*</claw_context>\s*"
+)
+# 旧版：工作空间约束在用户原文前（桌面 stripWorkspaceDirective 同口径）
+_LEADING_WORKSPACE_RE = re.compile(
+    r"^<claw_workspace>[^\r\n]*</claw_workspace>\r?\n(?:【工作空间】[^\r\n]*\r?\n\r?\n)?"
+)
 
 
 def _strip_injected_directives(query: str) -> str:
-    """NEW 上报前剥离渠道注入段（<claw_workspace>/<claw_time> 尾段；各档文案同形态）。"""
-    return _WORKSPACE_DIRECTIVE_TAIL_RE.sub("", query).rstrip()
+    """NEW 上报前剥离渠道注入段（工作空间/时间尾段 + 桌面 claw_context 前缀）。"""
+    stripped = _LEADING_WORKSPACE_RE.sub("", query)
+    stripped = _WORKSPACE_DIRECTIVE_TAIL_RE.sub("", stripped)
+    stripped = _CONTEXT_PREFIX_RE.sub("", stripped)
+    return stripped.strip()
 
 
 def xiaoyi_billing_enabled() -> bool:
@@ -171,8 +200,18 @@ def has_reported_new(core: str) -> bool:
     return core in _new_reported
 
 
-async def _post_once(np_base: str, token: str, trace_id: str, payload: dict[str, Any]) -> bool:
-    """经 np://claw-billing 上报一次；2xx 返回 True，其余 False（响应码由代理透传上游）。"""
+async def _post_once(
+    np_base: str,
+    token: str,
+    trace_id: str,
+    payload: dict[str, Any],
+    extra_headers: dict[str, str] | None = None,
+) -> bool:
+    """经 np://claw-billing 上报一次；2xx 返回 True，其余 False（响应码由代理透传上游）。
+
+    extra_headers 仅用于终态上报携带本地会话/轮次 id（桌面计费代理解析 FINISH 响应后
+    广播「点数消耗」）；代理侧会在转发上游前剥离这些内部头。
+    """
     import httpx  # 延迟导入：非桌面形态零依赖开销
 
     from jiuwenswarm.common.np_transport import named_pipe_transport_for
@@ -188,12 +227,40 @@ async def _post_once(np_base: str, token: str, trace_id: str, payload: dict[str,
             headers={
                 "Authorization": f"Bearer {token}",
                 "x-hag-trace-id": trace_id,
+                **(extra_headers or {}),
             },
         )
         return 200 <= resp.status_code < 300
 
 
-async def _run_report(status: str, trace_id: str, payload: dict[str, Any]) -> None:
+def _local_header_value(value: str | None) -> str | None:
+    """本地会话/轮次 id → 内部头值：去空白、限长、仅可打印 ASCII（头注入/编码防护）。"""
+    text = (value or "").strip()
+    if not text or len(text) > _LOCAL_HEADER_VALUE_MAX:
+        return None
+    if any(ord(ch) < 0x21 or ord(ch) > 0x7E for ch in text):
+        return None
+    return text
+
+
+def _report_extra_headers(
+    local_session_id: str | None,
+    local_run_id: str | None,
+) -> dict[str, str]:
+    """终态上报的本地标识头（缺任一项则不带；代理只透传本地展示，不参与上游协议）。"""
+    session = _local_header_value(local_session_id)
+    run = _local_header_value(local_run_id)
+    if not session or not run:
+        return {}
+    return {LOCAL_SESSION_HEADER: session, LOCAL_RUN_HEADER: run}
+
+
+async def _run_report(
+    status: str,
+    trace_id: str,
+    payload: dict[str, Any],
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     """执行一次上报（失败重试 1 次）；任何失败仅记日志——计费永不影响会话主路径。"""
     cfg = _billing_config()
     if cfg is None:
@@ -202,7 +269,7 @@ async def _run_report(status: str, trace_id: str, payload: dict[str, Any]) -> No
     tag = f"[billing] status={status} traceid={trace_id}"
     for attempt in (1, 2):
         try:
-            ok = await _post_once(np_base, token, trace_id, payload)
+            ok = await _post_once(np_base, token, trace_id, payload, extra_headers)
             if ok:
                 logger.info("%s 上报成功", tag)
                 return
@@ -214,9 +281,14 @@ async def _run_report(status: str, trace_id: str, payload: dict[str, Any]) -> No
     logger.warning("%s 上报最终失败（本轮计费可能丢失）", tag)
 
 
-def _schedule_report(status: str, trace_id: str, payload: dict[str, Any]) -> bool:
+def _schedule_report(
+    status: str,
+    trace_id: str,
+    payload: dict[str, Any],
+    extra_headers: dict[str, str] | None = None,
+) -> bool:
     """派发一次上报（fire-and-forget，不阻塞调用方主路径）。成功派发返回 True。"""
-    coro = _run_report(status, trace_id, payload)
+    coro = _run_report(status, trace_id, payload, extra_headers)
     try:
         task = asyncio.create_task(coro)
     except Exception:  # noqa: BLE001 - 无运行中事件循环等
@@ -262,10 +334,16 @@ def report_terminal(
     session_id: str,
     interaction_id: str,
     ok: bool,
+    local_session_id: str | None = None,
+    local_run_id: str | None = None,
 ) -> bool:
     """上报终态（FINISH/FAILED，一轮 query 收口）。守卫：未登记 NEW 的轮次不发
     orphan 终态（slash/早退路径）；调用方负责 HITL 挂起不调用本函数
-    （续跑收口时才发）。CancelledError 由调用方按 ok=True（FINISH）处理。
+    （续跑收口时才发）。CancelledError（用户主动停止）由调用方按 ok=False（FAILED）处理。
+
+    local_session_id / local_run_id 为桌面本地会话与轮次 id（手机入站轮次也有），
+    随请求内部头上送；桌面计费代理据此把 FINISH 响应里的 consumedPoints 广播回
+    渲染层（气泡「点数消耗」）。缺省不带，不改变原协议。
     """
     if not trace_id or not xiaoyi_billing_enabled():
         return False
@@ -283,7 +361,9 @@ def report_terminal(
         session_id=session_id,
         interaction_id=interaction_id,
     )
-    return _schedule_report(status, trace_id, payload)
+    return _schedule_report(
+        status, trace_id, payload, _report_extra_headers(local_session_id, local_run_id)
+    )
 
 
 def reset_xiaoyi_billing_registry() -> None:
@@ -292,6 +372,7 @@ def reset_xiaoyi_billing_registry() -> None:
 
 
 __all__ = [
+    "ROUTING_INJECTED_METADATA_KEY",
     "has_reported_new",
     "report_new",
     "report_terminal",

@@ -38,6 +38,8 @@ def test_desktop_inject_skips_finished_xiaoyi_task_id(monkeypatch: pytest.Monkey
         "xiaoyi_session_id": "phone-sess",
         "xiaoyi_conversation_id": "conv-1",
         "xiaoyi_root_session_id": "root-1",
+        # 注入侧同时打路由标记：计费侧据此判定这些字段只用于回发寻址（计费归桌面主进程）
+        "xiaoyi_routing_injected": True,
     }
 
 

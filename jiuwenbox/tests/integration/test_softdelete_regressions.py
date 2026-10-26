@@ -226,15 +226,16 @@ def test_local_long_path_delete_without_broker(tmp_path, dll, child_env):
     assert len(files) == 1 and files[0].read_text() == "local extended-path payload"
 
 
-def test_invalid_token_keeps_source(tmp_path, dll, broker):
+def test_invalid_token_falls_back_to_physical_delete(tmp_path, dll, broker):
+    """非法 token 时回收失败, 但删除请求本身必须完成 (降级为物理删除)."""
     _server, env, archive, requests = broker
-    victim = tmp_path / "keep.txt"
-    victim.write_text("keep me")
+    victim = tmp_path / "delete.txt"
+    victim.write_text("delete me")
     env["JIUWENBOX_SOFT_DELETE_RECYCLE_TOKEN"] = "invalid-test-token"
     code = f"import ctypes,os\nctypes.WinDLL({str(dll)!r})\nos.remove({str(victim)!r})"
     result = run_child([sys.executable, "-c", code], env)
-    assert result.returncode != 0 and "PermissionError" in result.stderr
-    assert victim.read_text() == "keep me"
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not victim.exists()
     assert not requests and not archive.exists()
 
 

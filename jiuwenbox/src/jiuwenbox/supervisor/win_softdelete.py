@@ -33,6 +33,7 @@ _LOG_LAYOUT_KEYS = (
 )
 _DLL_NAME = "jiuwen_softdelete.dll"
 _PATCH_ONLY = "JIUWENBOX_SOFT_DELETE_PATCH_ONLY"
+_ERROR_ACCESS_DENIED = 5
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +113,64 @@ def merge_soft_delete_spawn_env(env: dict[str, str]) -> None:
             env.setdefault(key, value)
 
 
+def sandbox_can_load_dll(dll: Path, sid: str) -> bool:
+    """判断 jbx-sandbox 是否已经能读取并执行这支 DLL.
+
+    打包安装到 Program Files 后, 安装器的 ACL 加固让宿主用户对 DLL 只剩
+    ``Users: RX``, 没有 WRITE_DAC; 此时重写 DACL 会被拒绝. 只要现有 ACE
+    已经满足加载条件, 就不该再写一次.
+
+    安装器只授 ``Users`` 组, 沙箱用户靠组成员资格拿到权限, 因此判定要把
+    本地登录必然携带的组 SID 一并算进去. Deny 优先; 继承专用 ACE 不作用于
+    对象本身, 不参与判定.
+    """
+    try:
+        import win32security  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - 仅 Windows 缺 pywin32 时触发
+        return False
+    from jiuwenbox.supervisor import win_acl, win_constants
+
+    try:
+        sid_obj = win32security.ConvertStringSidToSid(sid)
+        sd = win32security.GetNamedSecurityInfo(
+            str(dll),
+            win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION,
+        )
+    except Exception:  # 读不到 DACL 一律按"不满足"处理, 交给授权流程.
+        logger.debug("读取软删除 DLL DACL 失败, 按未授权处理 dll=%s", dll, exc_info=True)
+        return False
+    dacl = sd.GetSecurityDescriptorDacl()
+    if dacl is None:
+        return False
+    token_keys = {
+        win_acl._sid_dedup_key(sid_obj),
+        win_constants.SID_BUILTIN_USERS,
+        win_constants.SID_AUTHENTICATED_USERS,
+        win_constants.SID_EVERYONE,
+    }
+    inherit_only = getattr(win32security, "INHERIT_ONLY_ACE", 0x8)
+    allowed = 0
+    denied = 0
+    for index in range(dacl.GetAceCount()):
+        # GetAce 的返回元组形态随 pywin32 版本变化, 复用 win_acl 的兼容解析.
+        ace_type, ace_flags, access_mask, ace_sid = win_acl._parse_getace_tuple(
+            dacl.GetAce(index),
+        )
+        if ace_sid is None or win_acl._sid_dedup_key(ace_sid) not in token_keys:
+            continue
+        if ace_flags & inherit_only:
+            continue
+        if ace_type == win_constants.ACCESS_DENIED_ACE_TYPE:
+            denied |= int(access_mask)
+        elif ace_type == win_constants.ACCESS_ALLOWED_ACE_TYPE:
+            allowed |= int(access_mask)
+    needed = win_constants.ALLOW_READ_EXECUTE_RIGHTS
+    if denied & needed:
+        return False
+    return (allowed & needed) == needed
+
+
 def prepare_dll_for_sandbox_user() -> Path:
     """让 jbx-sandbox 能 LoadLibrary 这支 DLL. 失败直接抛出."""
     if sys.platform != "win32":
@@ -124,14 +183,31 @@ def prepare_dll_for_sandbox_user() -> Path:
     sid = win_setup.get_sandbox_user_sid()
     if not sid:
         raise RuntimeError("jbx-sandbox SID is missing; cannot grant DLL access")
-    win_acl.grant_parent_traverse(str(dll), sid)
-    win_acl.grant_ace(
-        str(dll),
-        sid,
-        rights=win_constants.ALLOW_READ_EXECUTE_RIGHTS,
-        mode="ALLOW",
-        recursive=False,
-    )
+    if sandbox_can_load_dll(dll, sid):
+        logger.debug("软删除 DLL 已对沙箱用户可读, 跳过 DACL 改写 dll=%s", dll)
+        # 读权限已经有了, 仍补一次父目录 traverse (best-effort, 内部吞异常):
+        # 自定义安装目录下可能只有 DLL 可读而祖先目录不可穿越.
+        win_acl.grant_parent_traverse(str(dll), sid)
+        return dll
+    try:
+        win_acl.grant_parent_traverse(str(dll), sid)
+        win_acl.grant_ace(
+            str(dll),
+            sid,
+            rights=win_constants.ALLOW_READ_EXECUTE_RIGHTS,
+            mode="ALLOW",
+            recursive=False,
+        )
+    except Exception as exc:  # 只有"已够用却被拒"才降级, 其余照常抛出
+        if (
+            getattr(exc, "winerror", None) != _ERROR_ACCESS_DENIED
+            or not sandbox_can_load_dll(dll, sid)
+        ):
+            raise
+        logger.warning(
+            "改软删除 DLL DACL 被拒, 但沙箱用户已具备读执行权限, 继续注入 dll=%s: %s",
+            dll, exc,
+        )
     return dll
 
 

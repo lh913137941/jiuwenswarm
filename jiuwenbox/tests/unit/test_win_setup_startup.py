@@ -23,6 +23,8 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(setup, "_logon_sandbox_user", lambda password, **kwargs: True)
     monkeypatch.setattr(setup, "_is_admin", lambda: False)
     monkeypatch.setattr(setup, "_can_write_dac", lambda path: True)
+    # 软删除 DLL 的补授权单独覆盖, 默认视为已授权, 避免每个用例都触发 install.
+    monkeypatch.setattr(setup, "soft_delete_dll_acl_missing", lambda: False)
     return registry
 
 
@@ -137,6 +139,7 @@ def test_authorization_only_does_not_rebuild_account_or_network(monkeypatch, sta
     monkeypatch.setattr(setup, "get_sandbox_user_sid", lambda: "S-1-sandbox")
     monkeypatch.setattr(setup, "_reg_set_str", state.__setitem__)
     monkeypatch.setattr(setup, "_record_acl_policy_paths", Mock())
+    monkeypatch.setattr(setup, "_ensure_soft_delete_dll_acl", Mock())
     setup.install(authorize_only=True, acl_paths=[str(path)], host_user_sid="S-1-original-user")
     assert grant.call_args.args[1] == "S-1-original-user"
     create_user.assert_not_called()
@@ -191,3 +194,35 @@ def test_runtime_acl_missing_permission_fails_closed(monkeypatch, state, tmp_pat
     with pytest.raises(RuntimeError, match="补授权"):
         setup.ensure_acl_policy_paths_authorized([str(path)], allow_elevation=False)
     install.assert_not_called()
+
+
+def test_missing_soft_delete_dll_acl_triggers_authorize_only(monkeypatch, state, tmp_path):
+    path = tmp_path / "external"
+    path.mkdir()
+    monkeypatch.setattr(setup, "_is_admin", lambda: True)
+    monkeypatch.setattr(setup, "soft_delete_dll_acl_missing", lambda: True)
+    install = Mock()
+    monkeypatch.setattr(setup, "install", install)
+    setup.ensure_windows_setup(acl_paths=[str(path)])
+    install.assert_called_once()
+    assert install.call_args.kwargs["authorize_only"] is True
+    assert install.call_args.kwargs["force"] is False
+
+
+def test_soft_delete_acl_missing_without_elevation_only_warns(monkeypatch, state):
+    """软删除补授权是 best-effort, 不能因此让沙箱起不来."""
+    monkeypatch.setattr(setup, "soft_delete_dll_acl_missing", lambda: True)
+    install = Mock()
+    monkeypatch.setattr(setup, "install", install)
+    setup.ensure_windows_setup(allow_elevation=False)
+    install.assert_not_called()
+
+
+def test_soft_delete_acl_elevation_failure_only_warns(monkeypatch, state):
+    """仅因软删除触发提权时, 用户取消 UAC 不应中止沙箱启动."""
+    monkeypatch.setattr(setup, "_is_admin", lambda: True)
+    monkeypatch.setattr(setup, "soft_delete_dll_acl_missing", lambda: True)
+    install = Mock(side_effect=RuntimeError("elevation cancelled"))
+    monkeypatch.setattr(setup, "install", install)
+    setup.ensure_windows_setup()
+    install.assert_called_once()

@@ -31,10 +31,11 @@
  * Delete calls are turned into a recycle-bin move, or a same-volume rename
  * into the archive directory. A sandbox process turns a relative name into a
  * full path first, then asks box-server to recycle it as the logged-in user.
- * box-server does not share this process's current directory. The file stays
- * when that request fails. The original delete is not called after a
- * successful soft delete. A move that fails leaves the file in place and
- * returns STATUS_ACCESS_DENIED. NtClose and NtSetInformationFile put the
+ * box-server does not share this process's current directory. The original
+ * delete is not called after a successful soft delete. Soft delete is best
+ * effort: when the recycle bin, archive, or broker is unavailable, the
+ * original delete runs so the caller's request still completes. NtClose and
+ * NtSetInformationFile put the
  * calling thread's last error back: those calls also run while another
  * API is cleaning up, and that API still needs its own error. If one
  * hook cannot be installed, the transaction is aborted and the loader
@@ -2085,6 +2086,33 @@ static NTSTATUS NTAPI hook_NtClose(HANDLE handle) {
     }
     if (!soft_delete_path(path)) {
         int gone = !path_exists(path);
+        if (!gone) {
+            DWORD attr = path_attributes(path);
+            /* Soft delete is best effort: finish the delete the caller asked
+             * for instead of failing the close. The handle is already closed,
+             * so delete by path; revalidate the file id first because the
+             * name may have been reused while recycling was attempted. */
+            if (!path_has_file_id(path, have_id, volume, index_high, index_low)) {
+                log_line(L"soft-delete failed; path reused, physical delete skipped");
+            } else if (attr != INVALID_FILE_ATTRIBUTES) {
+                wchar_t *api_path = filesystem_path(path);
+                int saved_bypass = t_bypass;
+                log_line(L"soft-delete failed; falling back to physical delete");
+                t_bypass = 1;
+                if (api_path != NULL) {
+                    /* A directory reparse point is removed with RemoveDirectoryW,
+                     * which deletes the link itself. */
+                    if ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                        g_remove_directory(api_path);
+                    } else {
+                        g_delete_file(api_path);
+                    }
+                }
+                t_bypass = saved_bypass;
+                HeapFree(GetProcessHeap(), 0, api_path);
+            }
+            gone = !path_exists(path);
+        }
         if (gone) {
             wchar_t msg[1024];
             /* The close already succeeded and the path is empty. Reporting
@@ -2134,8 +2162,16 @@ static NTSTATUS NTAPI hook_NtDeleteFile(OBJECT_ATTRIBUTES_ *oa) {
     ok = soft_delete_path(path);
     HeapFree(GetProcessHeap(), 0, path);
     if (!ok) {
-        SetLastError(ERROR_ACCESS_DENIED);
-        return STATUS_ACCESS_DENIED;
+        /* Soft delete is best effort; run the original delete so the caller's
+         * request still completes when recycling is unavailable. */
+        NTSTATUS fallback;
+        int saved_bypass = t_bypass;
+        log_line(L"soft-delete failed; falling back to physical delete");
+        t_bypass = 1;
+        fallback = g_nt_delete_file(oa);
+        t_bypass = saved_bypass;
+        SetLastError(saved);
+        return fallback;
     }
     SetLastError(saved);
     return STATUS_SUCCESS;
@@ -2219,8 +2255,9 @@ static NTSTATUS NTAPI hook_NtSetInformationFile(
             path_from_handle(file, path, PATH_CAP);
             if (dest[0] != L'\0' && _wcsicmp(path, dest) != 0 && path_exists(dest) && !is_skipped_path(dest)
                 && !soft_delete_path(dest)) {
-                status = STATUS_ACCESS_DENIED;
-                handled = 1;
+                /* Soft delete is best effort; let the original rename replace
+                 * the destination. */
+                log_line(L"soft-delete failed; falling back to physical replace");
             }
         }
     }
@@ -3514,6 +3551,9 @@ static int directory_is_empty(const wchar_t *path) {
 static BOOL WINAPI hook_DeleteFileW(LPCWSTR path) {
     DWORD saved;
     DWORD attr;
+    BOOL ok;
+    DWORD err;
+    int saved_bypass;
     if (t_bypass) {
         return g_delete_file(path);
     }
@@ -3534,8 +3574,16 @@ static BOOL WINAPI hook_DeleteFileW(LPCWSTR path) {
         return g_delete_file(path);
     }
     if (!soft_delete_path(path)) {
-        SetLastError(ERROR_ACCESS_DENIED);
-        return FALSE;
+        /* Soft delete is best effort: the caller's delete must still happen
+         * when the recycle bin, archive, or broker is unavailable. */
+        log_line(L"soft-delete failed; falling back to physical delete");
+        saved_bypass = t_bypass;
+        t_bypass = 1;
+        ok = g_delete_file(path);
+        err = GetLastError();
+        t_bypass = saved_bypass;
+        SetLastError(ok ? saved : err);
+        return ok;
     }
     SetLastError(saved);
     return TRUE;
@@ -3544,6 +3592,9 @@ static BOOL WINAPI hook_DeleteFileW(LPCWSTR path) {
 static BOOL WINAPI hook_RemoveDirectoryW(LPCWSTR path) {
     DWORD saved;
     DWORD attr;
+    BOOL ok;
+    DWORD err;
+    int saved_bypass;
     if (t_bypass) {
         return g_remove_directory(path);
     }
@@ -3563,8 +3614,14 @@ static BOOL WINAPI hook_RemoveDirectoryW(LPCWSTR path) {
         return FALSE;
     }
     if (!soft_delete_path(path)) {
-        SetLastError(ERROR_ACCESS_DENIED);
-        return FALSE;
+        log_line(L"soft-delete failed; falling back to physical delete");
+        saved_bypass = t_bypass;
+        t_bypass = 1;
+        ok = g_remove_directory(path);
+        err = GetLastError();
+        t_bypass = saved_bypass;
+        SetLastError(ok ? saved : err);
+        return ok;
     }
     SetLastError(saved);
     return TRUE;

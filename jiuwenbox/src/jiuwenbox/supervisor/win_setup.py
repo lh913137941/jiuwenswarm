@@ -1607,6 +1607,10 @@ def install(
         if not sandbox_sid:
             raise RuntimeError("无法读取沙箱账户 SID")
         _preinstall_read_acl(preinstall_paths or [], sandbox_sid)
+        try:
+            _ensure_soft_delete_dll_acl(sandbox_sid)
+        except Exception:  # 软删除是 best-effort, 补授权失败不应阻断沙箱启动.
+            logger.warning("补授软删除 DLL 读取权限失败 (非致命)", exc_info=True)
         recorded = get_preinstalled_read_paths() | {
             os.path.expandvars(p).rstrip("\\/").lower() for p in (preinstall_paths or []) if os.path.exists(p)
         }
@@ -1628,8 +1632,9 @@ def install(
             if not sid:
                 sid = _lookup_user_sid(const.SANDBOX_USER_NAME)
             _ensure_interactive_logon_right(sid, fatal=False)
+            _ensure_soft_delete_dll_acl(sid)
         except Exception:  # noqa: BLE001
-            logger.warning("已安装路径补授允许本地登录失败 (非致命)", exc_info=True)
+            logger.warning("已安装路径补授允许本地登录/软删除 DLL 失败 (非致命)", exc_info=True)
         return
 
     logger.info("开始 Windows 沙箱安装...")
@@ -1804,6 +1809,12 @@ def install(
                 logger.info("已收敛宿主主目录与数据目录默认 ACL")
             except Exception:  # noqa: BLE001
                 logger.warning("收敛宿主默认 ACL 失败 (非致命)", exc_info=True)
+            # 完整安装也补一次: 覆盖安装会重置安装目录 ACL, 不自愈的话
+            # 沙箱 runner 无法 LoadLibrary 软删除 DLL.
+            try:
+                _ensure_soft_delete_dll_acl(sid)
+            except Exception:  # 补授权失败不影响安装结果.
+                logger.warning("完整安装补授软删除 DLL 读取权限失败 (非致命)", exc_info=True)
 
         # bundled-python 目录 (tools/python, tools/node 等) owner 可能是 Administrators,
         # 运行时 box-server 进程 (普通用户) 没有 WRITE_DAC, apply_sandbox_acl
@@ -2125,18 +2136,38 @@ def ensure_windows_setup(
         )
         required_acl = {_normalize_acl_path(p) for p in policy_acl if p and os.path.exists(p)}
         missing_acl = {p for p in required_acl if not _can_write_dac(p)}
-        if needs_install or new_paths or missing_acl:
+        # 完整安装本身会补授权; 只有已安装且 DLL 权限可能被覆盖安装重置时才探测.
+        soft_delete_acl_missing = False if needs_install else soft_delete_dll_acl_missing()
+        required_install = needs_install or bool(new_paths or missing_acl)
+        if required_install or soft_delete_acl_missing:
             if not allow_elevation and not _is_admin():
-                raise RuntimeError("Windows 沙箱尚未准备完成, 需要管理员安装、修复或补授权; 请重新启动以请求 UAC")
-            install(
-                force=needs_install or bool(new_paths or missing_acl),
-                preinstall_paths=sorted(requested | recorded) if needs_install else sorted(new_paths),
-                proxy_port_start=proxy_port_start,
-                proxy_port_end=proxy_port_end,
-                policy_path=policy_path,
-                acl_paths=sorted(required_acl),
-                authorize_only=not needs_install,
-            )
+                if required_install:
+                    raise RuntimeError(
+                        "Windows 沙箱尚未准备完成, 需要管理员安装、修复或补授权; 请重新启动以请求 UAC"
+                    )
+                # 软删除是 best-effort: 无法补授权时只降级, 不能让沙箱起不来.
+                logger.warning(
+                    "软删除 DLL 对沙箱用户不可读, 且当前无法提权补授权; 软删除将退化为物理删除"
+                )
+            else:
+                try:
+                    install(
+                        force=required_install,
+                        preinstall_paths=sorted(requested | recorded) if needs_install else sorted(new_paths),
+                        proxy_port_start=proxy_port_start,
+                        proxy_port_end=proxy_port_end,
+                        policy_path=policy_path,
+                        acl_paths=sorted(required_acl),
+                        authorize_only=not needs_install,
+                    )
+                except Exception:
+                    if required_install:
+                        raise
+                    # 只是软删除补授权失败 (例如用户取消了 UAC): 不能让沙箱起不来.
+                    logger.warning(
+                        "补授软删除 DLL 读取权限失败 (非致命); 软删除将退化为物理删除",
+                        exc_info=True,
+                    )
         if reg_get_str(const.REG_VALUE_INSTALLED) != "1":
             raise RuntimeError("沙箱初始化失败: 安装进程未写入完成标记")
         if any(p.rstrip("\\/").lower() not in get_preinstalled_read_paths() for p in requested if os.path.exists(p)):
@@ -2185,6 +2216,53 @@ def get_sandbox_user_sid() -> str | None:
     """从注册表读 jbx-sandbox 用户 SID."""
     _require_windows()
     return reg_get_str(const.REG_VALUE_SANDBOX_USER_SID)
+
+
+def soft_delete_dll_acl_missing() -> bool:
+    """软删除 DLL 存在, 但沙箱用户读不到它.
+
+    覆盖安装会用 ``icacls /reset`` 重置安装目录 ACL, 而"已安装"路径不会
+    重新授权; 把它作为触发补授权的条件, 否则沙箱 runner 无法 LoadLibrary,
+    软删除会静默退化为物理删除.
+    """
+    try:
+        from jiuwenbox.supervisor import win_softdelete
+
+        dll = win_softdelete.dll_path()
+        if not dll.is_file():
+            return False
+        sid = get_sandbox_user_sid() or _lookup_user_sid(const.SANDBOX_USER_NAME)
+        if not sid:
+            return False
+        return not win_softdelete.sandbox_can_load_dll(dll, sid)
+    except Exception:  # 探测失败按"不缺"处理, 不阻断 sandbox 启动.
+        logger.debug("探测软删除 DLL 访问权限失败", exc_info=True)
+        return False
+
+
+def _ensure_soft_delete_dll_acl(sandbox_sid: str | None) -> None:
+    """给软删除 DLL 补沙箱用户读执行权限.
+
+    只在 install 的提权路径里调用, 因为宿主用户对安装目录通常没有 WRITE_DAC.
+    """
+    if not sandbox_sid:
+        return
+    from jiuwenbox.supervisor import win_acl, win_constants, win_softdelete
+
+    dll = win_softdelete.dll_path()
+    if not dll.is_file():
+        return
+    if win_softdelete.sandbox_can_load_dll(dll, sandbox_sid):
+        return
+    win_acl.grant_parent_traverse(str(dll), sandbox_sid)
+    win_acl.grant_ace(
+        str(dll),
+        sandbox_sid,
+        rights=win_constants.ALLOW_READ_EXECUTE_RIGHTS,
+        mode="ALLOW",
+        recursive=False,
+    )
+    logger.info("已补授软删除 DLL 读取权限: %s", dll)
 
 
 def get_sandbox_user_password() -> str | None:

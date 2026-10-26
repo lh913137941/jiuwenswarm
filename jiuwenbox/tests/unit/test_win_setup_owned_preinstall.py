@@ -25,6 +25,7 @@ def test_owned_new_tool_dir_is_granted_without_reinstall(monkeypatch, tmp_path):
     monkeypatch.setattr(win_setup, "_is_admin", lambda: False)
     monkeypatch.setattr(win_setup, "_verify_or_reset_sandbox_user_password", lambda: None)
     monkeypatch.setattr(win_setup, "_resolve_install_log_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(win_setup, "soft_delete_dll_acl_missing", lambda: False)
     def record_install(**kwargs):
         recorded = win_setup.get_preinstalled_read_paths() | {
             p.rstrip("\\/").lower() for p in kwargs["preinstall_paths"]

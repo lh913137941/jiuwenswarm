@@ -58,6 +58,11 @@ logger = logging.getLogger(__name__)
 _STATUS_PATH = "/fulfillment/v1/fulfillments/celia/task/status/update"
 _REQUEST_TIMEOUT_SECONDS = 15.0
 
+# 「取 consumedPoints」的等待上限（秒）：展示值的收集不得拖住调用方主路径（cron 最终
+# 推送）。上报本身始终在后台任务里完成（含失败重试与单请求 15s 超时），等待超时只是
+# 放弃本轮展示值，不取消上报、不影响计费落账。
+_POINTS_WAIT_SECONDS = 5.0
+
 # 桌面端在手机发起的话题里续发消息时，agent_ws_server._inject_session_xiaoyi_routing
 # 会把会话里的 xiaoyi_* 回发寻址字段注入 request.metadata。这些字段只用于渠道回发，
 # 不能当成"本轮来自 xiaoyi 渠道"的计费信号——桌面续轮由桌面主进程申报计费，后端再报
@@ -403,26 +408,16 @@ def reset_xiaoyi_billing_registry() -> None:
     _new_reported.clear()
 
 
-async def report_terminal_with_points(
+async def _report_terminal_with_points_once(
     trace_id: str,
     *,
     session_id: str,
     interaction_id: str,
     ok: bool,
 ) -> float | None:
-    """上报终态并返回本轮消耗点数（FINISH 响应顶层 consumedPoints），无法取得返回 None。
-
-    与 report_terminal 同协议、同守卫（未登记 NEW 的轮次不发），差别只在调用方
-    需要拿到服务端响应：gateway cron 调度器把该值并入最终推送，桌面渲染层才能
-    在定时任务会话里展示「点数消耗」。失败重试 1 次；任何失败只记日志并返回
-    None——计费结果已在服务端落账，展示缺省不影响主路径。
-    """
-    if not trace_id or not xiaoyi_billing_enabled():
-        return None
-    if not has_reported_new(trace_id):
-        return None
+    """执行一次「终态上报 + 取回点数」（非 2xx/异常重试 1 次），返回 FINISH 的点数。"""
     cfg = _billing_config()
-    if cfg is None:
+    if cfg is None:  # 调用方已校验，这里防御
         return None
     np_base, token, uid, device_id = cfg
     status = "FINISH" if ok else "FAILED"
@@ -448,6 +443,54 @@ async def report_terminal_with_points(
             await asyncio.sleep(1)
     logger.warning("%s 上报最终失败（本轮计费可能丢失）", tag)
     return None
+
+
+async def report_terminal_with_points(
+    trace_id: str,
+    *,
+    session_id: str,
+    interaction_id: str,
+    ok: bool,
+    wait_timeout: float = _POINTS_WAIT_SECONDS,
+) -> float | None:
+    """上报终态并返回本轮消耗点数（FINISH 响应顶层 consumedPoints），取不到返回 None。
+
+    与 report_terminal 同协议、同守卫（未登记 NEW 的轮次不发），差别只在调用方需要
+    拿到服务端响应值：gateway cron 调度器把该值并入最终推送，桌面渲染层才能在定时
+    任务会话里展示「点数消耗」。
+
+    契约：**上报不因本调用的等待上限而中断**——上报在后台任务里完成（失败重试 1 次、
+    单请求 15s 超时都留在后台，任务登记防 GC），调用方最多等 wait_timeout 秒（默认
+    _POINTS_WAIT_SECONDS=5s；<=0 表示只发起、不等待）。超时即返回 None（本轮按「缺省
+    不展示」处理），计费落账不受影响：管道挂起时 cron 最终推送不会被计费链路拖住，
+    不会出现等满两次请求超时的延迟。
+    """
+    if not trace_id or not xiaoyi_billing_enabled():
+        return None
+    if not has_reported_new(trace_id):
+        return None
+    if _billing_config() is None:
+        return None
+    task = asyncio.create_task(
+        _report_terminal_with_points_once(
+            trace_id, session_id=session_id, interaction_id=interaction_id, ok=ok
+        ),
+        name=f"cron-billing-points-{trace_id}",
+    )
+    _REPORT_TASKS.add(task)
+    task.add_done_callback(_REPORT_TASKS.discard)
+    try:
+        # shield：等待超时/调用方被取消都不影响上报本身（计费不丢）
+        return await asyncio.wait_for(asyncio.shield(task), timeout=wait_timeout)
+    except asyncio.TimeoutError:
+        logger.info(
+            "[billing] 取点数等待超时（%.1fs，上报继续在后台完成）traceid=%s",
+            wait_timeout,
+            trace_id,
+        )
+        return None
+    except Exception:  # noqa: BLE001 - 取不到展示值只影响展示，不影响主路径
+        return None
 
 
 __all__ = [

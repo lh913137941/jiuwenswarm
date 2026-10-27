@@ -15,6 +15,7 @@ from openjiuwen.core.single_agent.interrupt.exception import ToolInterruptExcept
 from openjiuwen.core.single_agent.interrupt.state import RESUME_USER_INPUT_KEY
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ToolCallInputs
 from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
+from openjiuwen.harness.prompts import PromptSection
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.rails.interrupt.ask_user_rail import AskUserRequest
 
@@ -39,6 +40,15 @@ DEEPRESEARCH_EXECUTION_STATE_KEY = "deepresearch_execution_states"
 DEEPRESEARCH_EXECUTION_ALIAS_KEY = "deepresearch_execution_aliases"
 _TOKENS_KEY = "__deepresearch_execution_context_tokens__"
 _TOOL_NAME = "deepresearch_execute"
+_BRIEF_REFRESH_SECTION = "deepresearch_brief_refresh"
+_BRIEF_REFRESH_INSTRUCTION = (
+    "本轮已由服务端校验为 refresh_latest_brief：补充证据后重新交付精简报告。"
+    "加载 deepresearch 技能，然后调用一次 deepresearch_execute，query 使用本轮用户的补充要求，"
+    "report_type='brief'、upgrade_from_brief=False；执行工具会核对来源报告并读取原报告。"
+    "必须生成并交付包含补充数据、事实依据和来源的新版精简报告文件，不要只在聊天里回答。"
+    "用户所说的‘不需要重新生成完整报告’指不生成专业版，不禁止生成新版精简报告。"
+    "不要升级专业版、不要另建 todo，也不要重复发送工具已交付的报告。"
+)
 
 # HITL 暂停占位文案（interaction 分支写入 tool_msg）。必须注册进
 # StreamEventRail 的占位模板白名单（_is_legacy_tool_interrupt_placeholder_text）：
@@ -274,8 +284,10 @@ class DeepResearchExecutionRail(DeepAgentRail):
         self._materials_context_provider = materials_context_provider
         self._mcp_context_provider = mcp_context_provider
         self._agent_id = "jiuwenswarm"
+        self.system_prompt_builder: Any = None
 
     def init(self, agent: Any) -> None:
+        self.system_prompt_builder = getattr(agent, "system_prompt_builder", None)
         card = getattr(agent, "card", None)
         self._agent_id = str(
             getattr(card, "id", "")
@@ -283,16 +295,49 @@ class DeepResearchExecutionRail(DeepAgentRail):
             or "jiuwenswarm"
         ).strip()
 
+    def uninit(self, agent: Any) -> None:
+        builder = getattr(agent, "system_prompt_builder", None) or self.system_prompt_builder
+        if builder is not None:
+            builder.remove_section(_BRIEF_REFRESH_SECTION)
+        self.system_prompt_builder = None
+
+    async def before_model_call(self, ctx: AgentCallbackContext) -> None:
+        builder = getattr(getattr(ctx, "agent", None), "system_prompt_builder", None)
+        if builder is not None:
+            self.system_prompt_builder = builder
+        builder = self.system_prompt_builder
+        if builder is None:
+            return
+        # Agent instances can be reused: refresh instructions belong to one request.
+        builder.remove_section(_BRIEF_REFRESH_SECTION)
+        request_context = get_request_context(
+            session_id=extract_session_id_from_callback(ctx)
+        )
+        followup = (request_context or {}).get("deepresearch_followup")
+        if not isinstance(followup, Mapping) or followup.get("action") != "refresh_latest_brief":
+            return
+        language = getattr(builder, "language", "cn") or "cn"
+        builder.add_section(PromptSection(
+            name=_BRIEF_REFRESH_SECTION,
+            content={language: _BRIEF_REFRESH_INSTRUCTION},
+            priority=121,
+        ))
+
     async def before_tool_call(self, ctx: AgentCallbackContext) -> None:
         if _tool_name(ctx) != _TOOL_NAME:
             return
         tool_call_id = _tool_call_id(ctx)
         workflow_id = _workflow_id(ctx.session, tool_call_id)
         states = _load_states(ctx.session)
-        if workflow_id not in states:
+        request_context = get_request_context(
+            session_id=extract_session_id_from_callback(ctx)
+        )
+        deepresearch_followup = (request_context or {}).get("deepresearch_followup")
+        args = _tool_args(ctx)
+        is_upgrade = deepresearch_followup is not None or args.get("upgrade_from_brief") is True
+        if workflow_id not in states and not is_upgrade:
             # state miss 兜底桥：硬中断丢失 conversation_id 后模型换新
             # tool_call_id 重试时，桥回旧 workflow state 直通续跑。
-            args = _tool_args(ctx)
             workflow_id = _bridge_stale_workflow(
                 ctx.session,
                 tool_call_id,
@@ -307,9 +352,6 @@ class DeepResearchExecutionRail(DeepAgentRail):
             _save_states(ctx.session, current)
 
         model = self._model_provider() if callable(self._model_provider) else None
-        request_context = get_request_context(
-            session_id=extract_session_id_from_callback(ctx)
-        )
         request_id = str((request_context or {}).get("request_id") or "").strip()
         requested_report_type = (request_context or {}).get("requested_report_type")
         mcp_servers = self._mcp_context_provider() if callable(self._mcp_context_provider) else None
@@ -324,6 +366,7 @@ class DeepResearchExecutionRail(DeepAgentRail):
             agent_id=self._agent_id,
             request_id=request_id,
             requested_report_type=requested_report_type,
+            deepresearch_followup=deepresearch_followup,
             materials_context=(
                 self._materials_context_provider() if callable(self._materials_context_provider) else None
             ),

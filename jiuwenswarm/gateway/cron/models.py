@@ -630,6 +630,9 @@ class CronRunState:
     timezone: str | None = None
     exec_channel_id: str | None = None
     exec_session_id: str | None = None
+    # 本轮计费 FINISH 响应携带的消耗点数（scheduler finally 收口时填入）；
+    # 随最终推送下发，桌面渲染层据此展示「点数消耗」。FAILED/未取得为 None。
+    consumed_points: float | None = None
     # Delivery tracking (filled by _push_to_targets)
     delivered: bool = False
     delivery_status: str = "unknown"  # unknown|delivered|failed|not-requested

@@ -293,6 +293,74 @@ def cli_basename(token: str) -> str:
     return lower
 
 
+def connector_calls_for_command(
+    command: str, *, connectors_dir: Path | None = None
+) -> list[dict[str, str]]:
+    """Describe explicit CLI calls, once per connector within a tool call.
+
+    Only command positions in simple shell chains are inspected. Argument text,
+    redirected filenames and opaque scripts are not connector invocations.
+    Known CLI names without an explicit connector ID still carry their name.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return []
+    lexer = shlex.shlex(command, posix=False, punctuation_chars=";&|<>\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    by_name = {
+        cli_basename(name): spec.id
+        for spec in connector_cli_registry(connectors_dir=connectors_dir)
+        for name in spec.commands
+    }
+    known = {cli_basename(name) for name in collect_connector_cli_names(connectors_dir=connectors_dir)}
+    calls: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    command_start, redirect_target = True, False
+    in_comment = False
+    for token in tokens:
+        if token and set(token) <= {";", "\n", "&", "|"} and "\n" in token:
+            in_comment = False
+            command_start, redirect_target = True, False
+            continue
+        if in_comment:
+            continue
+        if token.startswith("#"):
+            in_comment = True
+            continue
+        if token and set(token) <= {";", "&", "|"}:
+            command_start, redirect_target = True, False
+            continue
+        if token and set(token) <= {"<", ">"}:
+            redirect_target = True
+            continue
+        if redirect_target:
+            redirect_target = False
+            continue
+        if not command_start:
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+            continue
+        command_start = False
+        name = cli_basename(token)
+        if name not in known:
+            continue
+        connector_id = by_name.get(name, "")
+        key = ("id", connector_id) if connector_id else ("name", name)
+        if key not in seen:
+            seen.add(key)
+            calls.append({
+                "resource_type": "connector",
+                "resource_id": connector_id,
+                "resource_name": name,
+            })
+    return calls
+
+
 def is_connector_cli_name(token: str, *, connectors_dir: Path | None = None) -> bool:
     name = cli_basename(token)
     if not name:

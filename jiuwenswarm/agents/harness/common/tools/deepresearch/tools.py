@@ -22,11 +22,12 @@ import unicodedata
 import uuid
 import zipfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import AsyncExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
 from openjiuwen.core.foundation.tool import tool
 from openjiuwen.core.sys_operation.cwd import get_cwd
@@ -756,6 +757,12 @@ def _encode_deepresearch_config(config: dict[str, str]) -> bytes:
 def _config_secret_values(config: dict[str, str]) -> tuple[str, ...]:
     """Return request-scoped secret values without retaining ambient state."""
     values = set()
+    try:
+        for server in json.loads(config.get("MCP_SERVERS_JSON", "[]")):
+            values.update(value for value in server.get("headers", {}).values() if isinstance(value, str) and value)
+            values.update(value for _, value in parse_qsl(urlsplit(server.get("server_url", "")).query) if value)
+    except (ValueError, TypeError, AttributeError):
+        pass
     for key, value in config.items():
         is_secret = value and any(
             marker in str(key).upper() for marker in _SECRET_CONFIG_KEY_MARKERS
@@ -2543,15 +2550,86 @@ def _synthesize_claim_interrupted_outcome(
     }
 
 
+
+
+async def _push_materials_progress(content: str) -> None:
+    """Use the existing trusted route for bounded preparation status only."""
+    route = _get_route()
+    if not route.get("session_id") or not route.get("channel_id"):
+        return
+    try:
+        await WebSocketGatewayPushTransport().send_push({
+            "request_id": route.get("request_id", ""), "channel_id": route["channel_id"],
+            "session_id": route["session_id"], "is_complete": False,
+            "payload": {"event_type": "chat.reasoning", "content": content},
+        })
+    except Exception:  # Progress transport cannot change material failure semantics.
+        logger.warning("[deepresearch] material progress push unavailable")
+
+
+_materials_reference_ctx: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "deepresearch_materials_reference", default=None)
+_mcp_servers_ctx: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
+    "deepresearch_mcp_servers", default=None)
+
+
+# Both dedicated entry points must hand new research back to the same Skill.
+MODEL_RESEARCH_FALLBACK_ERRORS = frozenset({
+    "runner_missing", "runtime_python_missing", "runtime_python_invalid", "search_config_missing",
+})
+MODEL_RESEARCH_FALLBACK_HINT = (
+    "专用研究能力在启动前不可用，尚未启动研究或交付报告。"
+    '下一步必须重新调用 skill_tool(skill_name="deepresearch", relative_file_path="SKILL.md")，'
+    "从最新版 SKILL.md 的‘模型研究路径’第 1 步‘明确问题与范围’重新开始，"
+    "由当前主模型完整执行各步，最后保存并交付 Markdown。"
+    "不要用历史经验中的‘多子代理并行检索后汇总’替代该流程，"
+    "不要因降级自动派发子代理；历史经验与当前 Skill 冲突时以当前 Skill 为准。"
+    "不要重试 deepresearch_execute 或 deepresearch_stream，"
+    "不要把内部错误、接手通知或执行过程写进最终报告。"
+)
+
+
+def build_model_research_fallback(query: str, file_name: str) -> dict[str, str]:
+    """Point the main model at Skill step 1 rather than prescribing another plan."""
+    return {
+        "mode": "model_research", "query": query, "file_name": file_name,
+        "restart_from": "明确问题与范围",
+    }
+
+
+def _startup_error_outcome(
+    action: str, error_code: str, error: str, query: str, file_name: str,
+) -> str:
+    outcome = {"status": "error", "error_code": error_code, "error": error}
+    if action == "start" and query.strip() and error_code in MODEL_RESEARCH_FALLBACK_ERRORS:
+        outcome["fallback"] = build_model_research_fallback(query, file_name)
+        outcome["content"] = MODEL_RESEARCH_FALLBACK_HINT
+    return json.dumps(outcome, ensure_ascii=False)
+
+
 async def _call_deepresearch_stream_impl(
-    *, _router_state: object | None = None, **kwargs: Any
+    *, _router_state: object | None = None, _materials_reference: dict | None = None,
+    _mcp_servers: list[dict] | None = None, **kwargs: Any
 ) -> str:
     token = _deepresearch_router_state_ctx.set(_router_state)
+    materials_token = _materials_reference_ctx.set(_materials_reference)
     try:
-        stream_impl = getattr(deepresearch_stream, "_func")
-        return await stream_impl(**kwargs)
+        async with AsyncExitStack() as stack:
+            from .mcp_search import search_mcp_gateway
+            try:
+                native_servers = await stack.enter_async_context(search_mcp_gateway(_mcp_servers))
+            except Exception:
+                return json.dumps({"status": "error", "error_code": "mcp_gateway_unavailable",
+                                   "error": "DeepResearch MCP authorization endpoint is unavailable"})
+            mcp_token = _mcp_servers_ctx.set(native_servers)
+            try:
+                stream_impl = getattr(deepresearch_stream, "_func")
+                return await stream_impl(**kwargs)
+            finally:
+                _mcp_servers_ctx.reset(mcp_token)
     finally:
         _deepresearch_router_state_ctx.reset(token)
+        _materials_reference_ctx.reset(materials_token)
 
 
 @tool(
@@ -2611,19 +2689,11 @@ async def deepresearch_stream(  # pylint: disable=huawei-too-many-arguments
         python_bin = resolve_python_executable()
     except DeepResearchRuntimeError as exc:
         code = str(exc)
-        return json.dumps(
-            {"status": "error", "error_code": code, "error": code},
-            ensure_ascii=False,
-        )
+        return _startup_error_outcome(action, code, code, query, file_name)
     script = _resolve_run_script()
     if not script:
-        return json.dumps(
-            {
-                "status": "error",
-                "error_code": "runner_missing",
-                "error": "run_deepsearch.py not found",
-            },
-            ensure_ascii=False,
+        return _startup_error_outcome(
+            action, "runner_missing", "run_deepsearch.py not found", query, file_name,
         )
 
     # 认领停止快照时按 claim node 推导的阶段提示(消费点 set/reset);
@@ -2755,6 +2825,13 @@ async def deepresearch_stream(  # pylint: disable=huawei-too-many-arguments
             ensure_ascii=False,
         )
 
+    materials_reference = _materials_reference_ctx.get()
+    if materials_reference:
+        if materials_reference.get("conversation_id") != conversation_id:
+            return json.dumps({"status": "error", "error_code": "materials_scope_invalid"})
+        argv.extend(("--materials-file", materials_reference["path"],
+                     "--materials-sha256", materials_reference["sha256"]))
+
     try:
         config = _build_deepresearch_request_config(
             interactive_ask=True,
@@ -2763,6 +2840,9 @@ async def deepresearch_stream(  # pylint: disable=huawei-too-many-arguments
         )
         if report_type is not None:
             config["REPORT_TYPE"] = report_type
+        mcp_servers = _mcp_servers_ctx.get()
+        if mcp_servers:
+            config["MCP_SERVERS_JSON"] = json.dumps(mcp_servers, ensure_ascii=False)
         child_env = _build_deepresearch_child_env(
             interactive_ask=True,
             service_id=str(route.get("service_id") or "default"),
@@ -2770,13 +2850,15 @@ async def deepresearch_stream(  # pylint: disable=huawei-too-many-arguments
             runtime_config=config,
             executable=python_bin,
         )
+        if mcp_servers:
+            # Only the private loopback endpoint bypasses configured HTTP proxies.
+            bypass = child_env.get("NO_PROXY") or child_env.get("no_proxy") or ""
+            child_env["NO_PROXY"] = ",".join(filter(None, (bypass, "127.0.0.1")))
+            child_env["no_proxy"] = child_env["NO_PROXY"]
         config_frame = _encode_deepresearch_config(config)
     except DeepResearchRuntimeError as exc:
         code = str(exc)
-        return json.dumps(
-            {"status": "error", "error_code": code, "error": code},
-            ensure_ascii=False,
-        )
+        return _startup_error_outcome(action, code, code, query, file_name)
     except Exception as exc:  # pylint: disable=broad-exception-caught
         return json.dumps(
             {
@@ -2788,13 +2870,8 @@ async def deepresearch_stream(  # pylint: disable=huawei-too-many-arguments
         )
     search_error = _validate_deepresearch_search_config(config)
     if search_error:
-        return json.dumps(
-            {
-                "status": "error",
-                "error_code": "search_config_missing",
-                "error": search_error,
-            },
-            ensure_ascii=False,
+        return _startup_error_outcome(
+            action, "search_config_missing", search_error, query, file_name,
         )
 
     try:
@@ -3500,6 +3577,11 @@ async def _consume_stream(
                 type(exc).__name__,
             )
             return False
+
+    materials_reference = _materials_reference_ctx.get()
+    if materials_reference and action == "start":
+        from .materials import material_summary
+        await send({"event_type": "chat.reasoning", "content": material_summary(materials_reference)})
 
     outcome: dict[str, Any] = {
         "status": "error",

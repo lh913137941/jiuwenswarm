@@ -437,6 +437,34 @@ def test_composed_permanent_approval_stays_in_user_source(service):
     ]
 
 
+@pytest.mark.parametrize("kind", ["compound", "single"])
+def test_composed_shell_approval_batch_persists_together_and_rejects_invalid_batch(service, tmp_path, kind):
+    from openjiuwen.harness.security.permission_engine.approve.operation_grants import (
+        build_operation_grant, build_operation_grants,
+    )
+
+    service.initialize_from_live()
+    args = {
+        "command": "cd repo && git status" if kind == "compound" else "git status",
+        "workdir": str(tmp_path),
+    }
+    grants = build_operation_grants(
+        "bash", args, {},
+        mode="allow_with_scope", scope="subcommands",
+    )
+    if kind == "single":
+        grants.append(build_operation_grant("bash", args, {}))
+    assert service.persist_user_approvals(grants)
+    assert service.persist_user_approvals(grants)
+    stored = load_yaml_round_trip(service.config_path)["permissions"]["approval_overrides"]
+    assert stored[-2:] == grants
+    assert len(stored) == 3  # Existing approval plus this complete, deduplicated batch.
+    before = service.local_path.read_bytes()
+    with pytest.raises(ValueError, match="requires an id"):
+        service.persist_user_approvals([grants[0], {**grants[1], "id": ""}])
+    assert service.local_path.read_bytes() == before
+
+
 def test_legacy_edit_keeps_sandbox_retry_for_unchanged_network_axis(service):
     live = load_yaml_round_trip(service.config_path)
     live["sandbox"]["enabled"] = True

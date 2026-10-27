@@ -139,11 +139,15 @@ async def test_stop_timeout_kills_before_draining_shutdown_logs(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("platform", ["win32", "linux"])
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("implicit_git", [False, True])
 async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
-    tmp_path, monkeypatch, platform, enabled,
+    tmp_path, monkeypatch, platform, enabled, implicit_git,
 ):
     from jiuwenswarm.common import config
 
+    for key in list(os.environ):
+        if key.startswith("JIUWENBOX_"):
+            monkeypatch.delenv(key)
     allowlist = ["HOST_TOOL_TOKEN", "HOST_PYTHON_EXE", "CUSTOM_TOOL_SETTING", "EMPTY_TOOL_SETTING"]
     paths = [str(tmp_path / "shared-dependencies")]
     tools = {"read_roots": [str(tmp_path / "tools")], "executable_dirs": [str(tmp_path / "tools")]}
@@ -162,7 +166,11 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
     policy = tmp_path / "policy.yaml"
     policy.write_text("version: 1", encoding="utf-8")
     monkeypatch.setattr(runner_module, "_cleanup_stale_win_proxy_ports", lambda: None)
-    monkeypatch.setattr(runner_module, "_resolve_jiuwenbox_src_dir", lambda: None)
+    source = tmp_path / "jiuwenbox-src"
+    source.mkdir()
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    monkeypatch.setattr(runner_module, "_resolve_jiuwenbox_src_dir", lambda: source)
     monkeypatch.setattr(runner, "_register_atexit_once", Mock())
     monkeypatch.setattr(runner, "_bind_win_job", Mock())
     monkeypatch.setattr(runner, "_prepare_windows_setup", AsyncMock())
@@ -175,7 +183,18 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
     monkeypatch.setenv("EMPTY_TOOL_SETTING", "")
     monkeypatch.setenv("HOST_TOOL_TOKEN", "test-tool-token")
     monkeypatch.setenv("HOST_PYTHON_EXE", "C:/managed/python.exe")
-    monkeypatch.setenv("JIUWENBOX_TOOL_PATHS", json.dumps(tools))
+    if implicit_git:
+        git = tmp_path / "git-win"
+        for name in ("cmd/git.exe", "bin/bash.exe", "usr/bin/bash.exe"):
+            path = git / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        tools = {"read_roots": [str(git)],
+                 "executable_dirs": [str(git / name) for name in ("cmd", "bin", "usr/bin")]}
+        monkeypatch.delenv("JIUWENBOX_TOOL_PATHS", raising=False)
+        monkeypatch.setenv("PATH", str(git / "cmd"))
+    else:
+        monkeypatch.setenv("JIUWENBOX_TOOL_PATHS", json.dumps(tools))
     monkeypatch.setenv("CLAW_SKILL_TOKEN", "unlisted-product-token")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-be-forwarded")
     monkeypatch.setenv("DATABASE_URL", "must-not-be-forwarded")
@@ -192,8 +211,8 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
     ))
     monkeypatch.setattr(runner_module.asyncio, "create_subprocess_exec", spawn)
     bootstrap_env = {
-        "JIUWENBOX_RUNNER_PYTHON": "C:/Python312/python.exe",
-        "JIUWENBOX_SKILLS_DIR": "C:/workspace/skills",
+        "JIUWENBOX_RUNNER_PYTHON": str(tmp_path / "missing-runner" / "python.exe"),
+        "JIUWENBOX_SKILLS_DIR": str(skills),
         "CUSTOM_TOOL_SETTING": "startup-override",
     }
     assert await runner.ensure_running(policy_path=policy, extra_env=bootstrap_env)
@@ -207,8 +226,12 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
         if platform == "win32":
             assert call.kwargs["stdin"] == subprocess.PIPE
             assert call.args[2] == "jiuwenbox.server.parent_control"
-        assert env["JIUWENBOX_RUNNER_PYTHON"] == "C:/Python312/python.exe"
-        assert env["JIUWENBOX_SKILLS_DIR"] == "C:/workspace/skills"
+        assert env["JIUWENBOX_RUNNER_PYTHON"] == str(tmp_path / "missing-runner" / "python.exe")
+        assert env["JIUWENBOX_SKILLS_DIR"] == str(skills)
+        if platform == "win32":
+            assert json.loads(env["JIUWENBOX_SERVICE_READ_ROOTS"]) == [str(source.resolve())]
+        else:
+            assert "JIUWENBOX_SERVICE_READ_ROOTS" not in env
         assert env["JIUWENBOX_POLICY_PATH"] == str(policy)
         assert env["HOST_TOOL_TOKEN"] == "test-tool-token"
         assert env["HOST_PYTHON_EXE"] == "C:/managed/python.exe"
@@ -220,7 +243,16 @@ async def test_policy_reload_retains_bootstrap_env_until_explicitly_replaced(
         assert "DATABASE_URL" not in env
         assert json.loads(env["JIUWENBOX_ENV_ALLOWLIST"]) == allowlist
         assert json.loads(env["JIUWENBOX_PATH_ALLOWLIST"]) == paths
-        assert json.loads(env["JIUWENBOX_TOOL_PATHS"]) == tools
+        if implicit_git and platform != "win32":
+            assert "JIUWENBOX_TOOL_PATHS" not in env
+        else:
+            assert json.loads(env["JIUWENBOX_TOOL_PATHS"]) == tools
+
+    if platform == "win32":
+        assert runner._prepare_windows_setup.await_count == 2
+        for call in runner._prepare_windows_setup.await_args_list:
+            assert json.loads(call.args[0]["JIUWENBOX_TOOL_PATHS"]) == tools
+            assert json.loads(call.args[0]["JIUWENBOX_SERVICE_READ_ROOTS"]) == [str(source.resolve())]
 
     policy.write_text("version: 3", encoding="utf-8")
     assert await runner.ensure_running(policy_path=policy, extra_env={})

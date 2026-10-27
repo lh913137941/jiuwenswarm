@@ -359,7 +359,9 @@ def build_permission_rail(
         tool_names, llm is not None, model_name,
     )
     try:
-        def _persist_allow_rule(permissions: dict[str, Any], *, approval_grant: dict | None = None) -> bool:
+        def _persist_allow_rule(
+            permissions: dict[str, Any], *, approval_grants: list[dict],
+        ) -> bool:
             """Persist merged scenario lists to config.yaml.
 
             openjiuwen PermissionInterruptRail calls this when user selects "always allow".
@@ -372,7 +374,9 @@ def build_permission_rail(
                     persist_merged_allow_rule_snapshot,
                 )
 
-                return persist_merged_allow_rule_snapshot(permissions, approval_grant=approval_grant)
+                return persist_merged_allow_rule_snapshot(
+                    permissions, approval_grants=approval_grants,
+                )
             except Exception as exc:
                 logger.warning("[InterruptHelpers] persist_allow_rule failed: %s", exc)
                 return False
@@ -618,7 +622,10 @@ def build_permission_rail(
             )
 
         def _persist_session_allow_rule(
-            permissions: dict[str, Any], session_id: str | None = None
+            permissions: dict[str, Any],
+            session_id: str | None = None,
+            *,
+            approval_grants: list[dict],
         ) -> bool:
             from jiuwenswarm.agents.harness.common.rails.permissions.permissions_persist import (
                 persist_session_allow_rule,
@@ -626,7 +633,9 @@ def build_permission_rail(
 
             try:
                 return bool(
-                    persist_session_allow_rule(permissions, session_id=session_id)
+                    persist_session_allow_rule(
+                        permissions, session_id=session_id, approval_grants=approval_grants,
+                    )
                 )
             except Exception as exc:
                 logger.warning("[InterruptHelpers] persist_session_allow_rule failed: %s", exc)

@@ -12,6 +12,22 @@ Xiaoyi A2A `clientVariables.permission` travels in the request permission contex
 
 ## 1. Overview
 
+Before starting an internally managed Windows sandbox service, Swarm supplies common runtime declarations when `JIUWENBOX_TOOL_PATHS` is absent. It prefers the isolation venv, resolves its actual base Python, and finds standard Node and Git/Bash distributions on the service PATH. JiuwenBox prepares shared ACLs at service startup; sessions reuse those grants. Explicit declarations remain authoritative. This does not change shell approval rules or guarantee repair after arbitrary runtime upgrades. See [shared paths and environment configuration](../../jiuwenbox/docs/沙箱公共目录与环境变量配置.md) for the declaration and cache boundaries.
+
+Managed venv bases are pinned in a protected host-user registry key. The host is trusted: an explicit `JIUWENCLAW_BASE_PYTHON` takes precedence over the old pin and reprovisions the venv. A removed base also triggers host discovery and reprovisioning. A host-recreated venv can replace the old pin when its actual base matches the independently selected host interpreter; no registry cleanup is required. Normal startup reuses a valid pin, allowing tool Python and runner Python to differ. New or recovered venvs are verified before updating the pin, running pip, or publishing the base directory. Writable `pyvenv.cfg` changes alone cannot authorize a base that differs from the host selection.
+
+Ordinary venv provisioning failures are logged: the unusable `JIUWENBOX_VENV_DIR` is omitted, while host-selected `JIUWENBOX_BUNDLED_PYTHON` and `JIUWENCLAW_BASE_PYTHON` are still published. Trust-validation failures continue to block startup. On Linux, failure to resolve an existing venv falls back to subsequent host candidates, and `pyvenv.cfg` supports a `home` containing only `python3`. Optional Python discovery failures are logged and skipped without discarding other tool declarations.
+
+Source launches declare the known `jiuwenbox/src` through `JIUWENBOX_SERVICE_READ_ROOTS` to enable sandbox-account imports. Skill directories are not automatically made shared read-only roots; their existing read/write permissions and session cleanup remain unchanged. This import fix does not resolve skill dependency scan latency or introduce a mandatory full scan on every startup.
+
+JiuwenBox attempts bytecode migration for each declared read-only root only when object-level ACL preparation fails with Windows error 5 and no effective read denial applies. It removes only CPython cache files owned by the current sandbox account and backed by a source file inside the same canonical root. Original path components are still checked for links/reparse points before deletion; short aliases and `..` do not change the containment check. Directories (including empty `__pycache__` directories), unrelated artifacts, host-owned caches and orphan-owner files are not automatically removed or taken over. Required ACL failures remain fatal. Migration reuses the cold ACL walk; a cache hit adds no cleanup scan.
+
+The sandbox first-hop runner (`jiuwenbox.supervisor.win_exec`) receives `PYTHONPYCACHEPREFIX` from `ProcessRuntime._create_windows` before it is spawned. The second-hop command receives its own prefix from `_create_process_as_user`, under sandbox Temp with the existing workspace fallback. This does not refer to the host box-server launched by Swarm's `ensure_running`. Explicit Python flags or code that clears its environment can override Python's default cache behavior; source read-only ACLs still apply.
+
+ACL failure diagnostics include `root`, `path`, `operation`, `owner_sid`, `object_type`, `winerror`, `migration` and `required`. Owner metadata is queried only on failure; diagnostic failures do not replace the original exception. Candidate exclusions such as `directory_not_cache` or `owner_mismatch` are DEBUG messages, while required failures remain ERROR messages. Shared-root logs report `cache=hit/miss` and elapsed time. Stop affected processes and have the host administrator review the declared scope/policy and reinstall, rebuild or explicitly repair the identified runtime; no automatic elevation, ownership takeover or broad ACL reset is performed.
+
+Windows commands do not receive the four service declarations `JIUWENBOX_SERVICE_READ_ROOTS`, `JIUWENBOX_TOOL_PATHS`, `JIUWENBOX_PATH_ALLOWLIST` or `JIUWENBOX_ENV_ALLOWLIST`, even through inherited allowlists or `JIUWENBOX_INJECT_ENV` (case-insensitive filtering). The service's declarations remain unchanged; existing execution protocol and host soft-delete settings retain their behavior.
+
 | Capability | Description |
 |-----------|-------------|
 | **Three-tier actions** | `allow` executes directly; `ask` requires user confirmation (Web/CLI, etc.); `deny` rejects. |
@@ -118,9 +134,9 @@ Configuring `approval_overrides` without `external_directory` may still result i
 
 An ASK interrupts before the tool runs. The user can allow once, allow for the current session, always allow, or reject. Session grants are stored in the session overlay; permanent grants are stored in `permissions.approval_overrides`. Remembering another operation permanently does not promote existing session grants.
 
-`authorization_mode: allow` permits only the current object: resolved file paths and access actions, the exact URL, or the original unsplit command and working directory. `allow_with_scope` also permits a server-derived scope: a file's immediate parent directory (including descendants), or a URL's registrable domain and subdomains (keeping its scheme and port). Commands cannot be broadened. IP addresses, localhost and public suffixes do not offer domain broadening.
+`authorization_mode: allow` permits only the current object: resolved file paths and access actions, the exact URL, or the original unsplit command and working directory. `allow_with_scope` permits a server-derived scope: a file's immediate parent directory (including descendants), a URL's registrable domain and subdomains (keeping its scheme and port), or separately reusable shell subcommands bound to the original invocation directory. IP addresses, localhost and public suffixes do not offer domain broadening.
 
-New records use `match_type: exact_operation` and a structured JSON `pattern`. The engine checks them after all guards, and they only lift ASK; an explicit DENY still blocks execution, including a denial added while approval was pending. Existing path/command overrides and CLI-created rules retain their previous matching behavior.
+Object records use `match_type: exact_operation` and a structured JSON `pattern`; the engine checks them after all guards. Split shell approvals create a batch of `match_type: shell_subcommand` records, applied within ShellGuard before other guards are merged. They lift ordinary shell tool/command ASK or undetermined results while preserving structural checks and FileGuard, NetGuard and DeletionGuard decisions. Neither type overrides DENY, including a denial added while approval was pending. Existing overrides retain their matching behavior; saving a batch permanently does not promote unrelated session grants.
 
 The Web configuration panel displays **Sandbox → File Security Guard → Shell Security Guard → Network Security Guard**. The Sandbox card has one action row: **Sync file guard**, **Sync network guard**, then **Apply and recreate sandboxes**. Both sync actions only save their respective rules; the third applies both together. The separate Network Security Guard card configures `allow`, `ask` and `deny` rules.
 
@@ -230,7 +246,7 @@ Web errors have the shape `{"type":"res","id":"net-sync-1","ok":false,"error":".
 
 ### 5.3 Dynamic Authorization Protocol Fields
 
-The existing `chat.ask_user_question` event uses `source: "permission_interrupt"`. Each `questions[]` entry may include `authorization_scopes: [{value, label}]`. This is event metadata, not a new RPC. For `https://api.example.com/data`, an example scope list is:
+The existing `chat.ask_user_question` event uses `source: "permission_interrupt"`. Each `questions[]` entry may include `authorization_scopes: [{value, label}]`. This is event metadata, not a new RPC. The server default and Web prompt select the available broadened scope: `parent` for files, `domain` for URLs, and `subcommands` for shell calls. Clients omitting scope fields use the same server default. Users can explicitly select `exact`; the default does not approve execution. Unsupported operations or missing metadata remain exact-only, and each new request starts with its own default. For `https://api.example.com/data`, an example scope list is:
 
 ```json
 [
@@ -243,14 +259,21 @@ The client submits optional fields in `chat.user_answer` → `params.answers[]`:
 
 | Field / combination | Default and constraint |
 | --- | --- |
-| `authorization_mode` | Defaults to `allow`; accepts `allow` or `allow_with_scope` |
-| `authorization_scope` | Defaults to `exact`; accepts `exact`, `parent` or `domain`, subject to the actual object type |
+| `authorization_mode` | When omitted, inferred from the resolved scope: `allow` for `exact`, otherwise `allow_with_scope`. Explicit `allow` without a scope selects `exact` |
+| `authorization_scope` | When omitted, the server selects the applicable `parent`, `domain` or `subcommands`, falling back to `exact`. Explicit values must match the actual object type |
 | `allow` + `exact` | Current tool and resolved file paths/actions, exact URL, or original unsplit command plus working directory. Command wildcard characters stay literal |
 | `allow_with_scope` + `parent` | Immediate parent directory and descendants; preserves tool and access-action limits |
 | `allow_with_scope` + `domain` | Registrable domain and subdomains, preserving scheme and port; e.g. `api.example.co.uk` → `example.co.uk`. Not offered for IP addresses, localhost or public suffixes |
+| `allow_with_scope` + `subcommands` | One approval saves multiple literal child commands for independent or combined reuse; all retain the original invocation directory, tool, interpreter and lifetime |
 | `allow_with_scope` + `exact` | Valid; remains an exact-object authorization |
 
-Commands cannot be broadened. Grants for bash, powershell and mcp_exec_command bind their execution `workdir` (or contextual working directory) and `shell_type`; an unrecognised `cwd` cannot override that binding. Custom shell tools bind all arguments conservatively. Older object command grants without interpreter information require approval again. Scope and lifetime are independent; allow-once does not save a scope for future calls. Clients must use server-provided option values and scope choices, and cannot supply an arbitrary path or domain. Missing scope metadata should result in exact-only UI. Old clients omitting both new fields retain `allow/exact` behavior; these fields do not change ordinary question or other confirmation flows.
+Split scope reuses the existing AST and is offered only when it covers the whole input. Unreliably parsed structures, redirections and outer interpreter launchers fall back to `exact`. Custom shell tools bind all arguments conservatively and remain exact-only. Grants for bash, powershell and mcp_exec_command bind the original execution `workdir` (or contextual directory) and `shell_type`; an unrecognised `cwd` cannot override that binding. For `cd repo && git status` called from `E:\work`, both child grants bind `E:\work`, including the `git status` grant. FileGuard handles directory changes for its current path checks. Children may be reused alone or recombined from that initial directory; different arguments, interpreters or initial directories do not match. Unapproved children still require approval, and covered children are not executed early.
+
+The core-to-Swarm persistence callback uses only `approval_grants: list[dict]`, for both session and permanent approvals. A single object is a one-element list; a single Shell scope approval includes its child grant and an exact grant for that invocation. Each remembered approval invokes one batch write, preserving the batch's session ID and lifetime. Only that batch is saved, never unrelated grants from the merged snapshot. The desktop sends the user's answer through `chat.send`; it does not implement this Python persistence callback.
+
+An explicit `approval_grants=[]` succeeds immediately for session and permanent persistence without reading or writing configuration, clearing saved permissions, or falling back to the full snapshot. Internal management calls that omit the argument (`None`) retain snapshot handling. File, Net, and Shell keep their scope defaults and reusable shell combinations.
+
+Older object command grants without interpreter information require approval again. Scope and lifetime are independent; allow-once does not save a scope for future calls. Clients must use server-provided option values and scope choices, and cannot supply arbitrary paths, domains or children. Old clients omitting the new fields also use the server default scope. Explicit `exact` retains whole-command authorization; existing exact grants are not automatically converted into child grants.
 
 Ordinary permission prompts and ACP command prompts display the working directory captured when approval is requested: the tool's `workdir`, or the execution context directory when omitted. This display snapshot does not rewrite tool arguments and remains stable if the context later changes.
 

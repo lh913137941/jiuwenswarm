@@ -22,6 +22,9 @@ import threading
 from pathlib import Path
 
 from jiuwenswarm.common.utils import get_user_workspace_dir
+from jiuwenswarm.server.runtime.python_base_pin import (
+    RuntimePythonTrustError, read_python_base_pin, write_python_base_pin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -130,33 +133,110 @@ def _discover_system_python() -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def resolve_python_base(executable: Path) -> Path:
+    """Resolve a host-selected venv to its base without executing it or widening to its parent."""
+    seen: set[Path] = set()
+    candidate = executable.expanduser().absolute()
+    for _ in range(8):
+        if not candidate.is_file() or candidate in seen:
+            break
+        if os.name == "nt" and (candidate.name.lower() not in {"python.exe", "pythonw.exe"}
+                                or candidate.resolve().name.lower() not in {"python.exe", "pythonw.exe"}):
+            break
+        seen.add(candidate)
+        root = candidate.parent.parent if candidate.parent.name.lower() in {"scripts", "bin"} else candidate.parent
+        config = root / "pyvenv.cfg"
+        if not config.is_file():
+            if os.name == "nt" and candidate.parent.name.lower() == "scripts":
+                break
+            return candidate.resolve()
+        values = {}
+        for line in config.read_text(encoding="utf-8-sig").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key.strip().lower()] = value.strip()
+        candidates = [Path(values[key]) for key in ("base-executable", "executable") if values.get(key)]
+        if values.get("home"):
+            names = ("python.exe",) if os.name == "nt" else ("python", "python3")
+            candidates.extend(Path(values["home"]) / name for name in names)
+        next_candidate = next(
+            (path for path in candidates if path.is_absolute() and path.is_file() and path not in seen), None,
+        )
+        if next_candidate is None:
+            break
+        candidate = next_candidate
+    raise RuntimeError(f"Cannot resolve base Python from {executable}")
+
+
+def verified_runtime_python_base(venv_dir: Path, *, trusted_base: Path | None = None) -> Path:
+    """Validate against a host selection or pin before publishing writable venv metadata."""
+    try:
+        actual = resolve_python_base(_venv_scripts_dir(venv_dir) / "python.exe")
+        pinned = read_python_base_pin(venv_dir)
+        expected = trusted_base if trusted_base is not None else pinned
+        if expected is None or actual != expected.resolve() or actual.is_relative_to(venv_dir.resolve()):
+            raise RuntimePythonTrustError(f"Managed venv base does not match host Python pin: {venv_dir}")
+        if pinned != actual:
+            write_python_base_pin(venv_dir, actual, replace=trusted_base is not None)
+        return actual
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimePythonTrustError(f"Managed venv base validation failed for {venv_dir}: {exc}") from exc
+
+
 def resolve_base_python() -> Path:
     """Interpreter used as the base for isolation_venv creation."""
+    managed = get_runtime_venv_dir()
+
+    def trusted_host_base(candidate: Path) -> Path:
+        base = resolve_python_base(candidate)
+        if os.name == "nt" and (candidate.absolute().is_relative_to(managed.absolute())
+                                or base.is_relative_to(managed.resolve())):
+            raise RuntimePythonTrustError("Cannot establish host trust from the writable managed venv")
+        return base
+
     override = (os.environ.get("JIUWENCLAW_BASE_PYTHON") or "").strip()
     if override:
         candidate = Path(override).expanduser().resolve()
         if candidate.is_file():
-            return candidate
+            return trusted_host_base(candidate)
         raise RuntimeError(f"JIUWENCLAW_BASE_PYTHON does not exist: {candidate}")
+
+    if os.name == "nt" and (managed / "pyvenv.cfg").is_file():
+        pinned = read_python_base_pin(managed)
+        if pinned is not None and pinned.is_file():
+            try:
+                return verified_runtime_python_base(managed)
+            except RuntimePythonTrustError:
+                # A host-rebuilt venv may use the current host interpreter. Its
+                # metadata must still match that independent selection below.
+                logger.info("[pip_env] Rechecking managed venv against host Python selection: %s", managed)
+
+    if os.name != "nt":
+        existing = _venv_scripts_dir(managed) / "python"
+        if existing.is_file():
+            try:
+                return resolve_python_base(existing)
+            except (OSError, RuntimeError, ValueError) as exc:
+                logger.warning("[pip_env] Cannot resolve existing venv base; trying host Python: %s", exc)
 
     claw_home = (os.environ.get("CLAW_PYTHON_HOME") or "").strip()
     if claw_home:
         name = "python.exe" if os.name == "nt" else "python"
-        candidate = Path(claw_home).expanduser() / name
-        if candidate.is_file():
-            return candidate.resolve()
+        for candidate in (Path(claw_home).expanduser() / name, _venv_scripts_dir(Path(claw_home)) / name):
+            if candidate.is_file():
+                return trusted_host_base(candidate)
 
     executable = Path(sys.executable).resolve()
     if _is_python_executable(executable) and executable.is_file():
-        return executable
+        return trusted_host_base(executable)
 
     bundled = _discover_bundled_python()
     if bundled is not None:
-        return bundled
+        return trusted_host_base(bundled)
 
     system_python = _discover_system_python()
     if system_python is not None:
-        return system_python
+        return trusted_host_base(system_python)
 
     raise RuntimeError(
         "Cannot resolve base Python for isolation_venv. Set JIUWENCLAW_BASE_PYTHON "
@@ -207,16 +287,24 @@ def ensure_runtime_venv() -> Path:
     global _venv_ready
     venv_dir = get_runtime_venv_dir()
     pyvenv_cfg = venv_dir / "pyvenv.cfg"
-    if _venv_ready is not None and _venv_ready == venv_dir and pyvenv_cfg.is_file():
-        return venv_dir
-
     with _venv_lock:
-        if _venv_ready is not None and _venv_ready == venv_dir and pyvenv_cfg.is_file():
+        trusted_base = resolve_base_python() if os.name == "nt" else None
+        pinned = read_python_base_pin(venv_dir) if os.name == "nt" else None
+        refresh = pinned is not None and (
+            not pinned.is_file()
+            or (bool(os.environ.get("JIUWENCLAW_BASE_PYTHON", "").strip()) and pinned != trusted_base)
+        )
+        if _venv_ready == venv_dir and pyvenv_cfg.is_file() and not refresh:
+            if os.name == "nt":
+                verified_runtime_python_base(venv_dir, trusted_base=trusted_base)
             return venv_dir
 
         venv_dir.parent.mkdir(parents=True, exist_ok=True)
-        if not pyvenv_cfg.is_file():
+        if not pyvenv_cfg.is_file() or refresh:
             _create_runtime_venv_dir(venv_dir)
+
+        if os.name == "nt":
+            verified_runtime_python_base(venv_dir, trusted_base=trusted_base)
 
         runtime_py = get_runtime_python(ensure=False)
         if runtime_py.is_file():

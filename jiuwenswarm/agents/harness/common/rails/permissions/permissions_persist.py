@@ -519,6 +519,7 @@ def write_session_permissions_overlay(session_id: str, overlay: dict[str, Any]) 
 def persist_session_allow_rule(
     permissions: dict[str, Any],
     session_id: str | None = None,
+    *, approval_grants: list[dict] | None = None,
 ) -> bool:
     """Incrementally persist session overlay for this session.
 
@@ -526,9 +527,14 @@ def persist_session_allow_rule(
     overlay ∪ this remember). Only paths/overrides that are new or escalated
     relative to disk ∪ existing overlay are written.
 
+    Core approval callbacks supply ``approval_grants``. In that path, persist
+    only this batch instead of discovering unrelated changes in the snapshot.
+
     Prefer the explicit ``session_id`` from the rail (``ctx.session``). The
     request ContextVar is often empty on interrupt resume.
     """
+    if approval_grants == []:
+        return True
     sid = _overlay_session_id(session_id)
     if not sid:
         logger.warning(
@@ -539,7 +545,10 @@ def persist_session_allow_rule(
         return False
     existing = load_session_permissions_overlay(sid)
     baseline = apply_session_permissions_overlay(_disk_permissions(), existing)
-    delta = extract_session_overlay_delta(baseline, permissions)
+    requested = (
+        {"approval_overrides": approval_grants} if approval_grants is not None else permissions
+    )
+    delta = extract_session_overlay_delta(baseline, requested)
     if not delta:
         logger.info(
             "[PermissionPersist] persist_session_allow_rule.noop session=%s",
@@ -573,26 +582,31 @@ def get_permissions_with_session_overlay(
     return apply_session_permissions_overlay(base, overlay)
 
 
-def persist_merged_allow_rule_snapshot(permissions: dict[str, Any], *, approval_grant: dict | None = None) -> bool:
+def persist_merged_allow_rule_snapshot(
+    permissions: dict[str, Any], *, approval_grants: list[dict] | None = None,
+) -> bool:
     """HITL「永久记住」：把相对模板多出的场景 list 写入 config.yaml。"""
+    if approval_grants == []:
+        return True
     if not isinstance(permissions, dict):
         return False
     from jiuwenswarm.common.config import get_config
 
     live = get_config().get("permissions") or {}
+    grants = approval_grants
     if isinstance(live.get("composition"), dict):
-        if approval_grant is None:
+        if not grants:
             return False
         try:
             from jiuwenswarm.common.security_config_service import SecurityConfigService
 
-            return SecurityConfigService().persist_user_approval(approval_grant)
+            return SecurityConfigService().persist_user_approvals(grants)
         except Exception:
             logger.warning("[PermissionPersist] composed approval persist failed", exc_info=True)
             return False
     # Never promote other session grants when one operation is remembered forever.
-    if approval_grant is not None:
-        permissions = {"approval_overrides": [approval_grant]}
+    if grants is not None:
+        permissions = {"approval_overrides": grants}
     from jiuwenswarm.common.config import update_config
     from jiuwenswarm.common.config_split import _get, _user_only_list_items, upsert_list_by_id
     from jiuwenswarm.common.utils import get_package_config_file

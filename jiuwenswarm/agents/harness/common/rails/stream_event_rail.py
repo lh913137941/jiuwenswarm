@@ -12,7 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from pathlib import Path
 from typing import Any, List, Mapping, Optional
+
+import yaml
 
 from openjiuwen.core.context_engine.context.context_utils import ContextUtils
 from openjiuwen.core.foundation.llm import (
@@ -48,7 +51,8 @@ from jiuwenswarm.common.tool_display import (
     build_tool_display_name,
     extract_call_goal,
 )
-from jiuwenswarm.common.utils import logger
+from jiuwenswarm.common.connectors import connector_calls_for_command
+from jiuwenswarm.common.utils import get_agent_skills_dir, logger
 
 _TODO_TOOL_NAMES = frozenset(["todo_create", "todo_get", "todo_list", "todo_modify"])
 _TODO_TOOL_NAMES_WITH_IDX = frozenset(["todo_complete", "todo_remove", "todo_get", "todo_modify"])
@@ -77,6 +81,59 @@ def _parse_tool_call_arguments(tool_call: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _skill_name_from_arguments(args: dict[str, Any]) -> str:
+    for key in ("skill_name", "skillName"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _skill_resource_call(skill_name: str, directory: Path | None = None) -> dict[str, str]:
+    """Read local names and market identity without treating arbitrary names as IDs."""
+    resource = {"resource_type": "skill", "resource_id": "", "resource_name": skill_name}
+    if directory is None:
+        if skill_name in {".", ".."} or any(char in skill_name for char in "/\\:\x00"):
+            return resource
+        directory = get_agent_skills_dir() / skill_name
+
+    def read_json(path: Path) -> dict:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8-sig"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, ValueError, UnicodeError):
+            return {}
+
+    def text(value: Any) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    meta: dict = {}
+    try:
+        content = (directory / "SKILL.md").read_text(encoding="utf-8-sig")
+        header = re.match(r"\A---[ \t]*\r?\n(.*?)\r?\n---(?:\r?\n|$)", content, re.DOTALL)
+        value = yaml.safe_load(header.group(1)) if header else None
+        if isinstance(value, dict):
+            meta = value
+    except (OSError, UnicodeError, yaml.YAMLError):
+        pass
+    origin = read_json(directory / ".claw-origin.json")
+    state = read_json(directory.parent / "skills_state.json")
+    saved = next((
+        item for key in ("local_skills", "installed_plugins")
+        for item in (state.get(key) if isinstance(state.get(key), list) else [])
+        if isinstance(item, dict) and item.get("name") in {skill_name, text(meta.get("name"))}
+    ), {})
+    resource["resource_name"] = (
+        text(saved.get("display_name")) or text(meta.get("display_name"))
+        or text(meta.get("name")) or skill_name
+    )
+    resource["resource_id"] = text(meta.get("skillId")) or text(origin.get("skillId"))
+    if not resource["resource_id"] and origin.get("source") == "market":
+        # Desktop market installs use contentExtendParam.skillId as the directory slug.
+        resource["resource_id"] = directory.name
+    return resource
 
 
 def _extract_tool_interrupt(value: Any) -> Any | None:
@@ -706,6 +763,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                     tc,
                     model_display_name=model_display,
                     session_id=sid,
+                    skill_directory=self._resolve_skill_directory(tc, session),
                 )
                 await self._emit_tool_update(session, tc, status="in_progress")
             self._symphony_stream_handler.bind_progress(ctx, session, tc)
@@ -817,6 +875,27 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
     # Private helpers (migrated from JiuSwarmReActAgent)
     # ------------------------------------------------------------------
 
+    def _resolve_skill_directory(self, tool_call: Any, session: Session) -> Path | None:
+        """Use member/expert skill mounts when they differ from the global directory."""
+        if getattr(tool_call, "name", "") != "skill_tool":
+            return None
+        skill_name = _skill_name_from_arguments(_parse_tool_call_arguments(tool_call))
+        if not skill_name:
+            return None
+        configured_rails = getattr(self._deep_agent, "configured_rails", None)
+        if not callable(configured_rails):
+            return None
+        try:
+            for rail in configured_rails():
+                get_skills = getattr(rail, "get_skills_for_session", None)
+                if callable(get_skills):
+                    for skill in get_skills(session=session) or []:
+                        if skill.name == skill_name:
+                            return Path(skill.directory)
+        except Exception:
+            logger.debug("skill resource directory lookup failed", exc_info=True)
+        return None
+
     @staticmethod
     async def _emit_tool_call(
         session: Session,
@@ -824,6 +903,7 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         *,
         model_display_name: str = "",
         session_id: str = "",
+        skill_directory: Path | None = None,
     ) -> None:
         try:
             name = getattr(tool_call, "name", "")
@@ -833,6 +913,26 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                 "arguments": arguments,
                 "tool_call_id": getattr(tool_call, "id", ""),
             }
+            args = _parse_tool_call_arguments(tool_call)
+            skill_name = _skill_name_from_arguments(args)
+            if name == "skill_tool" and skill_name:
+                tool_call_payload["skill_name"] = skill_name
+                tool_call_payload["resource_calls"] = [{
+                    "resource_type": "skill", "resource_id": "", "resource_name": skill_name,
+                }]
+                try:
+                    tool_call_payload["resource_calls"] = [await asyncio.to_thread(
+                        _skill_resource_call, skill_name, skill_directory,
+                    )]
+                except Exception:
+                    logger.debug("skill resource metadata lookup failed", exc_info=True)
+            elif name in {"bash", "powershell", "mcp_exec_command", "exec_command", "execute_cmd"}:
+                try:
+                    calls = await asyncio.to_thread(connector_calls_for_command, args.get("command", ""))
+                    if calls:
+                        tool_call_payload["resource_calls"] = calls
+                except Exception:
+                    logger.debug("connector resource metadata lookup failed", exc_info=True)
             # 优先用主模型随 tool_call 产出的目标文案；未填时再规则兜底。
             # todo 工具：按 idx 反查 todo.md，把具体任务内容拼进展示名，避免「第3项」这类难懂文案。
             task_text = ""

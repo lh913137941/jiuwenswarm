@@ -166,6 +166,12 @@ apply_openai_sse_invoke_patch()
 # 原解析读 delta → 对话空返回（content_len=0）；delta 在场时补丁零介入
 apply_openai_sse_stream_patch()
 
+# 上下文压缩流式传输补丁：下游模型不支持非流式，压缩调用改为内部 stream() 聚合、
+# 对外保持非流式语义（一次 await invoke() 拿全量结果，前端零改动）。幂等。
+from jiuwenswarm.compression_stream_patch import apply_compression_stream_patch
+
+apply_compression_stream_patch()
+
 # 命名管道模型通道：桌面形态 API_BASE=np:// 时 LLM 调用走 Windows 命名管道
 # （非 np:// 时零行为变化；幂等）
 from jiuwenswarm.llm_np_patch import apply_openai_np_patch

@@ -5738,11 +5738,48 @@ class AgentWebSocketServer:
                 **({"network_status": "externally_managed"}
                    if get_sandbox_startup_mode() != "internal" else {})}
 
+    async def _get_conversation_history_async(
+        self, session_id: str, page_idx: int
+    ) -> dict[str, Any] | None:
+        """Keep full-history parsing off the loop, with one read per session."""
+        locks = getattr(self, "_history_read_locks", None)
+        if locks is None:
+            locks = self._history_read_locks = WeakValueDictionary()
+        session_key = session_id.strip() if isinstance(session_id, str) else ""
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = locks[session_key] = asyncio.Lock()
+        tasks = getattr(self, "_history_read_tasks", None)
+        if tasks is None:
+            tasks = self._history_read_tasks = set()
+
+        await lock.acquire()
+        try:
+            task = asyncio.create_task(asyncio.to_thread(
+                self.get_conversation_history, session_id=session_id, page_idx=page_idx
+            ))
+        except BaseException:
+            lock.release()
+            raise
+        tasks.add(task)
+
+        def finished(work: asyncio.Task) -> None:
+            tasks.discard(work)
+            lock.release()
+            # The request may have gone away while the worker was still running.
+            if not work.cancelled():
+                work.exception()
+
+        task.add_done_callback(finished)
+        # Cancelling a request cannot stop its thread. Keep its lock and task
+        # alive until the read really finishes, without delaying cancellation.
+        return await asyncio.shield(task)
+
     async def _handle_history_get(self, ws: Any, request: AgentRequest, send_lock: asyncio.Lock) -> None:
         params = request.params if isinstance(request.params, dict) else {}
         session_id = params.get("session_id")
         page_idx = params.get("page_idx")
-        data = self.get_conversation_history(session_id=session_id, page_idx=page_idx)
+        data = await self._get_conversation_history_async(session_id=session_id, page_idx=page_idx)
         if data is None:
             resp = AgentResponse(
                 request_id=request.request_id,
@@ -6275,7 +6312,7 @@ class AgentWebSocketServer:
         params = request.params if isinstance(request.params, dict) else {}
         session_id = params.get("session_id")
         page_idx = params.get("page_idx")
-        data = self.get_conversation_history(session_id=session_id, page_idx=page_idx)
+        data = await self._get_conversation_history_async(session_id=session_id, page_idx=page_idx)
         if data is None:
             err_chunk = AgentResponseChunk(
                 request_id=request.request_id,

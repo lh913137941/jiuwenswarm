@@ -2259,17 +2259,19 @@ class TestCronBilling:
     """
 
     @staticmethod
-    def _patch_billing(monkeypatch, calls):
+    def _patch_billing(monkeypatch, calls, points=None):
         def _fake_new(query, trace_id):
             calls.append(("new", query, trace_id))
             return True
 
-        def _fake_terminal(trace_id, *, session_id, interaction_id, ok):
+        async def _fake_terminal(trace_id, *, session_id, interaction_id, ok):
             calls.append(("terminal", trace_id, session_id, interaction_id, ok))
-            return True
+            return points
 
         monkeypatch.setattr(cron_scheduler_module, "billing_report_new", _fake_new)
-        monkeypatch.setattr(cron_scheduler_module, "billing_report_terminal", _fake_terminal)
+        monkeypatch.setattr(
+            cron_scheduler_module, "billing_report_terminal_with_points", _fake_terminal
+        )
 
     @pytest.mark.asyncio
     async def test_success_reports_new_then_finish(self, tmp_path, monkeypatch):
@@ -2293,6 +2295,95 @@ class TestCronBilling:
         ]
 
     @pytest.mark.asyncio
+    async def test_final_push_carries_consumed_points(self, tmp_path, monkeypatch):
+        """终态计费取回的 consumedPoints 随最终推送下发（桌面渲染层展示「点数消耗」）。"""
+        calls = []
+        self._patch_billing(monkeypatch, calls, points=0.29)
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        handler = FakeMessageHandler()
+        svc = _make_scheduler(store, handler)
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+        assert svc.runs[run_id].consumed_points == pytest.approx(0.29)
+
+        await svc._on_push(job, run_id)
+        finals = [
+            m
+            for m in handler.published
+            if (m.payload.get("cron") or {}).get("is_placeholder") is False
+        ]
+        assert finals, "应发出最终推送"
+        assert finals[-1].payload["cron"]["consumed_points"] == pytest.approx(0.29)
+
+    @pytest.mark.asyncio
+    async def test_final_push_omits_points_when_unavailable(self, tmp_path, monkeypatch):
+        """FAILED/取不到消耗点数时推送不携带该字段（渲染层不展示）。"""
+        calls = []
+        self._patch_billing(monkeypatch, calls, points=None)
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        handler = FakeMessageHandler()
+        svc = _make_scheduler(store, handler)
+
+        run_id = f"{job.id}:1234"
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        await svc._on_push(job, run_id)
+        finals = [
+            m
+            for m in handler.published
+            if (m.payload.get("cron") or {}).get("is_placeholder") is False
+        ]
+        assert finals
+        assert "consumed_points" not in finals[-1].payload["cron"]
+
+    @pytest.mark.asyncio
+    async def test_result_text_hidden_during_billing_wait(self, tmp_path, monkeypatch):
+        """计费收口等待窗口内到点的 push 事件不得把结果提前发走。
+
+        窗口内 state.result_text 仍为空 → _on_push 只能推占位、不会置 pushed_final；
+        收口之后补发的最终推送仍带 consumed_points（否则本轮「点数消耗」永远回填不上）。
+        """
+        store = CronJobStore(path=tmp_path / "cron_jobs.json")
+        job = await _create_one_job(store)
+        handler = FakeMessageHandler()
+        svc = _make_scheduler(store, handler)
+        run_id = f"{job.id}:1234"
+        seen: list[tuple[str, bool]] = []
+
+        async def _fake_terminal(trace_id, *, session_id, interaction_id, ok):
+            # 模拟「等待期间到点的 push 事件被事件循环处理」：此刻点数还没返回
+            await svc._on_push(job, run_id)
+            state = svc.runs[run_id]
+            seen.append((state.result_text, state.pushed_final))
+            return 0.29
+
+        monkeypatch.setattr(cron_scheduler_module, "billing_report_new", lambda q, t: True)
+        monkeypatch.setattr(
+            cron_scheduler_module, "billing_report_terminal_with_points", _fake_terminal
+        )
+
+        await svc.on_wake(job, run_id)
+        await svc.run_tasks[run_id]
+
+        assert len(seen) == 1  # 窗口内：结果尚不可见且未被提前置为已推送
+        text_seen, pushed_seen = seen[0]
+        assert not text_seen
+        assert pushed_seen is False
+        await svc._on_push(job, run_id)
+        finals = [
+            m
+            for m in handler.published
+            if (m.payload.get("cron") or {}).get("is_placeholder") is False
+        ]
+        assert finals
+        assert finals[-1].payload["cron"]["consumed_points"] == pytest.approx(0.29)
+
+    @pytest.mark.asyncio
     async def test_new_dispatched_before_chat_send(self, tmp_path, monkeypatch):
         """NEW 必须在 chat.send 派发前上报（余额/生命周期语义以 NEW 先行）。"""
         agent_client = FakeAgentClient()
@@ -2305,8 +2396,12 @@ class TestCronBilling:
             return True
 
         monkeypatch.setattr(cron_scheduler_module, "billing_report_new", _fake_new)
+
+        async def _fake_terminal(*_a, **_kw):
+            return None
+
         monkeypatch.setattr(
-            cron_scheduler_module, "billing_report_terminal", lambda *a, **kw: True
+            cron_scheduler_module, "billing_report_terminal_with_points", _fake_terminal
         )
         store = CronJobStore(path=tmp_path / "cron_jobs.json")
         job = await _create_one_job(store)

@@ -30,7 +30,7 @@ from jiuwenswarm.gateway.cron.store import CronJobStore
 from jiuwenswarm.gateway.message_handler.message_handler import MessageHandler
 from jiuwenswarm.common.billing_client import (
     report_new as billing_report_new,
-    report_terminal as billing_report_terminal,
+    report_terminal_with_points as billing_report_terminal_with_points,
 )
 from jiuwenswarm.common.e2a.gateway_normalize import e2a_from_agent_fields
 from jiuwenswarm.common.invocation_context.billing_trace import build_cron_trace_id
@@ -1064,6 +1064,8 @@ class CronSchedulerService:
             state.started_at = self._now_fn()
             await self._persist_run(job, state)
             ok = False
+            # 结果文本先用局部变量承接，计费收口（见 finally）之后再写入 state
+            text = ""
             mode = CRON_JOB_DEFAULT_MODE
             channel_id = ""
             exec_session_id = ""
@@ -1169,7 +1171,7 @@ class CronSchedulerService:
                         state=state,
                     )
                 await self._mark_last_session_ready(job, exec_session_id)
-                state.result_text = text
+                # 结果文本延后到 finally 的计费收口之后写入 state（见该处注释）
                 state.status = "succeeded" if ok else "failed"
             except asyncio.CancelledError:
                 state.status = "failed"
@@ -1185,21 +1187,27 @@ class CronSchedulerService:
                 state.error = str(exc)
             finally:
                 state.finished_at = self._now_fn()
-                # 计费终态：每轮必收口；NEW 未派发/未登记的轮次由 report_terminal
-                # 登记守卫跳过。取消（删任务/编辑重载/进程关停）按 FINISH——这是 cron
-                # 的任务生命周期取消（运行可能已产出/消耗资源），不等同于聊天里用户
-                # 对回答点「停止」；聊天侧取消按 FAILED（interface_deep）。两者口径
-                # 刻意不同，不要再按「对齐 xiaoyi 渠道主动停止」的旧注释改回。
+                # 计费终态：每轮必收口；NEW 未派发/未登记的轮次由终态上报的登记守卫跳过。
+                # 取消（删任务/编辑重载/进程关停）按 FINISH——这是 cron 的任务生命周期取消
+                # （运行可能已产出/消耗资源），不等同于聊天里用户对回答点「停止」；聊天侧
+                # 取消按 FAILED（interface_deep）。两者口径刻意不同，不要再按「对齐 xiaoyi
+                # 渠道主动停止」的旧注释改回。
+                # 收口时顺带取回 FINISH 响应的 consumedPoints 存进本轮状态（最终推送
+                # 带出给桌面展示）。等待上限（默认 5s）在 report_terminal_with_points 内部：
+                # 超时返回 None（本轮缺省不展示），上报仍在后台完成——计费落账不丢，
+                # 也不会出现等满两次请求超时的延迟。
                 if billing_trace_id:
-                    try:
-                        billing_report_terminal(
-                            billing_trace_id,
-                            session_id=quote(job.id, safe=""),
-                            interaction_id=quote(run_id, safe=""),
-                            ok=state.status == "succeeded" or state.error == "cancelled",
-                        )
-                    except Exception:  # noqa: BLE001 - 计费永不影响主路径
-                        logger.debug("[billing] cron 终态派发失败 run_id=%s", run_id, exc_info=True)
+                    state.consumed_points = await billing_report_terminal_with_points(
+                        billing_trace_id,
+                        session_id=quote(job.id, safe=""),
+                        interaction_id=quote(run_id, safe=""),
+                        ok=state.status == "succeeded" or state.error == "cancelled",
+                    )
+                # 结果文本排在计费收口之后写入 state：否则到点的 push 事件会在这段等待
+                # 窗口内把结果以「无 consumed_points」的最终推送提前发走并置 pushed_final，
+                # 随后运行方自己排的补发被跳过，本轮「点数消耗」就永远回填不上（见 _on_push）。
+                if text:
+                    state.result_text = text
                 is_cancelled_ghost = state.error == "cancelled"
                 should_deliver_result = bool(state.result_text) and not is_cancelled_ghost  # noqa: F841  # pre-existing
                 # Ensure failed runs also produce result_text so push logic can deliver it.
@@ -1612,6 +1620,13 @@ class CronSchedulerService:
                 "exec_session_id": state.exec_session_id,
                 "is_placeholder": bool(is_placeholder),
                 "status": state.status,
+                # 本轮消耗点数（终态计费 FINISH 响应）：桌面渲染层据此展示「点数消耗」；
+                # 占位推送/未取得（FAILED/超时）不带
+                **(
+                    {"consumed_points": state.consumed_points}
+                    if state.consumed_points is not None and not is_placeholder
+                    else {}
+                ),
             },
         }
         channel_id = (job.targets or "").strip()

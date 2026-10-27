@@ -48,9 +48,6 @@ def _now_utc_ts() -> float:
 _WORKSPACE_OPEN = "<claw_workspace>"
 _WORKSPACE_CLOSE = "</claw_workspace>"
 
-# 终态计费上报任务（防 GC；含超时后仍在后台完成的任务；done_callback 移除）
-_BILLING_TASKS: set[asyncio.Task] = set()
-
 
 def _cron_billing_enabled() -> bool:
     """cron 调度计费开关（默认开；JIUWEN_CRON_BILLING=off 关闭本路径）。
@@ -1067,6 +1064,8 @@ class CronSchedulerService:
             state.started_at = self._now_fn()
             await self._persist_run(job, state)
             ok = False
+            # 结果文本先用局部变量承接，计费收口（见 finally）之后再写入 state
+            text = ""
             mode = CRON_JOB_DEFAULT_MODE
             channel_id = ""
             exec_session_id = ""
@@ -1172,7 +1171,7 @@ class CronSchedulerService:
                         state=state,
                     )
                 await self._mark_last_session_ready(job, exec_session_id)
-                state.result_text = text
+                # 结果文本延后到 finally 的计费收口之后写入 state（见该处注释）
                 state.status = "succeeded" if ok else "failed"
             except asyncio.CancelledError:
                 state.status = "failed"
@@ -1194,25 +1193,21 @@ class CronSchedulerService:
                 # 取消按 FAILED（interface_deep）。两者口径刻意不同，不要再按「对齐 xiaoyi
                 # 渠道主动停止」的旧注释改回。
                 # 收口时顺带取回 FINISH 响应的 consumedPoints 存进本轮状态（最终推送
-                # 带出给桌面展示）；最多等 5s，超时后上报仍在后台继续，不阻塞收尾。
+                # 带出给桌面展示）。等待上限（默认 5s）在 report_terminal_with_points 内部：
+                # 超时返回 None（本轮缺省不展示），上报仍在后台完成——计费落账不丢，
+                # 也不会出现等满两次请求超时的延迟。
                 if billing_trace_id:
-                    billing_task = asyncio.create_task(
-                        billing_report_terminal_with_points(
-                            billing_trace_id,
-                            session_id=quote(job.id, safe=""),
-                            interaction_id=quote(run_id, safe=""),
-                            ok=state.status == "succeeded" or state.error == "cancelled",
-                        ),
-                        name=f"cron-billing-{run_id}",
+                    state.consumed_points = await billing_report_terminal_with_points(
+                        billing_trace_id,
+                        session_id=quote(job.id, safe=""),
+                        interaction_id=quote(run_id, safe=""),
+                        ok=state.status == "succeeded" or state.error == "cancelled",
                     )
-                    _BILLING_TASKS.add(billing_task)
-                    billing_task.add_done_callback(_BILLING_TASKS.discard)
-                    try:
-                        state.consumed_points = await asyncio.wait_for(
-                            asyncio.shield(billing_task), timeout=5.0
-                        )
-                    except Exception:  # noqa: BLE001 - 计费展示不阻塞主路径（含超时）
-                        state.consumed_points = None
+                # 结果文本排在计费收口之后写入 state：否则到点的 push 事件会在这段等待
+                # 窗口内把结果以「无 consumed_points」的最终推送提前发走并置 pushed_final，
+                # 随后运行方自己排的补发被跳过，本轮「点数消耗」就永远回填不上（见 _on_push）。
+                if text:
+                    state.result_text = text
                 is_cancelled_ghost = state.error == "cancelled"
                 should_deliver_result = bool(state.result_text) and not is_cancelled_ghost  # noqa: F841  # pre-existing
                 # Ensure failed runs also produce result_text so push logic can deliver it.

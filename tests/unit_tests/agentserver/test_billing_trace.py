@@ -449,27 +449,87 @@ class TestTerminalWithPoints:
         ) == pytest.approx(0.01)
 
     async def test_retry_once_then_points(self, monkeypatch) -> None:
-        post = _RecordingPost(fail_times=1, response={"consumedPoints": 0.12})
-        monkeypatch.setattr(billing_client, "_post_once", post)
+        # 终态第一次失败 → 重试一次成功；NEW 不参与失败计数（只让 FINISH 失败一次）
+        failed_once = {"done": False}
+        calls: list[str] = []
+
+        async def _post(np_base, token, trace_id, payload, extra_headers=None):
+            status = str(payload.get("conversationStatus"))
+            calls.append(status)
+            if status == "FINISH" and not failed_once["done"]:
+                failed_once["done"] = True
+                return None
+            return {"consumedPoints": 0.12}
+
+        monkeypatch.setattr(billing_client, "_post_once", _post)
         monkeypatch.setattr(asyncio, "sleep", _no_sleep)
         billing_client.report_new("q", "cron_r3")
         assert await billing_client.report_terminal_with_points(
             "cron_r3", session_id="job-1", interaction_id="run-3", ok=True
         ) == pytest.approx(0.12)
-        assert len(post.calls) == 2
+        assert [s for s in calls if s == "FINISH"] == ["FINISH", "FINISH"]
 
     async def test_gives_up_after_retry_returns_none(self, monkeypatch) -> None:
         post = _RecordingPost(fail_times=99, response={"consumedPoints": 0.12})
         monkeypatch.setattr(billing_client, "_post_once", post)
         monkeypatch.setattr(asyncio, "sleep", _no_sleep)
         billing_client.report_new("q", "cron_r4")
+        await _drain_report_tasks()
         assert (
             await billing_client.report_terminal_with_points(
                 "cron_r4", session_id="job-1", interaction_id="run-4", ok=True
             )
             is None
         )
-        assert len(post.calls) == 2
+        finishes = [c for c in post.calls if c["payload"]["conversationStatus"] == "FINISH"]
+        assert len(finishes) == 2  # 重试 1 次后放弃
+
+    async def test_wait_timeout_returns_none_but_report_continues(self, monkeypatch) -> None:
+        # 管道挂起（上报迟迟不返回）：调用方等满 wait_timeout 即返回 None（本轮按
+        # 「缺省不展示」处理），但上报本身不被取消——后台最终完成，计费落账不丢。
+        started = asyncio.Event()
+        release = asyncio.Event()
+        statuses: list[str] = []
+
+        async def _slow_post(np_base, token, trace_id, payload, extra_headers=None):
+            statuses.append(str(payload.get("conversationStatus")))
+            started.set()
+            await release.wait()
+            return {"consumedPoints": 0.29}
+
+        monkeypatch.setattr(billing_client, "_post_once", _slow_post)
+        billing_client.report_new("q", "cron_wait")
+        points = await billing_client.report_terminal_with_points(
+            "cron_wait",
+            session_id="job-1",
+            interaction_id="run-w",
+            ok=True,
+            wait_timeout=0.05,
+        )
+        assert points is None
+        assert started.is_set()  # 上报确已发起（在后台任务里）
+
+        release.set()
+        await _drain_report_tasks()  # 任务登记在 _REPORT_TASKS，可被 drain
+        assert "FINISH" in statuses
+
+    async def test_zero_wait_timeout_only_dispatches_report(self, monkeypatch) -> None:
+        # wait_timeout<=0：只发起上报、不等待（与 report_terminal 的 fire-and-forget 等价）
+        post = _RecordingPost(response={"consumedPoints": 0.33})
+        monkeypatch.setattr(billing_client, "_post_once", post)
+        billing_client.report_new("q", "cron_nowait")
+        assert (
+            await billing_client.report_terminal_with_points(
+                "cron_nowait",
+                session_id="job-1",
+                interaction_id="run-0",
+                ok=True,
+                wait_timeout=0,
+            )
+            is None
+        )
+        await _drain_report_tasks()
+        assert "FINISH" in [c["payload"]["conversationStatus"] for c in post.calls]
 
     async def test_requires_reported_new(self, monkeypatch) -> None:
         post = _RecordingPost(response={"consumedPoints": 0.1})

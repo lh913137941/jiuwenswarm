@@ -9119,6 +9119,12 @@ class JiuWenSwarmDeepAdapter:
             else:
                 if info.attr_name in _REQUIRED_AGENT_RAIL_ATTR_NAMES:
                     setattr(self, info.attr_name, None)
+                if (
+                    info.attr_name == "_permission_rail"
+                    and config_base.get("permissions", {}).get("enabled", False)
+                ):
+                    self._permission_rail = None
+                    raise RuntimeError("required_permission_rail_unavailable")
                 logger.warning("%s Rail %s build returned None", log_prefix, info.attr_name)
 
         # 用户配置的 hooks（UserHookRail）

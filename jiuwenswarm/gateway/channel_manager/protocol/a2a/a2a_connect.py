@@ -404,6 +404,8 @@ class A2AChannel(BaseChannel):
     ) -> _PendingA2ARequest:
         if self._on_message_cb is None:
             raise RuntimeError("A2AChannel on_message callback is not set")
+        if session_id and str(session_id).strip().lower().startswith(("cron", "__cron__")):
+            raise ValueError("reserved A2A context")
         pending = _PendingA2ARequest(queue=asyncio.Queue())
         self._pending[request_id] = pending
         try:
@@ -417,7 +419,15 @@ class A2AChannel(BaseChannel):
                 ok=True,
                 req_method=ReqMethod.CHAT_SEND,
                 is_stream=True,
-                metadata=dict(metadata or {}),
+                # A2A metadata is caller-controlled; never let it assert internal
+                # scheduler, team, or user provenance. Preserve only trace data.
+                metadata=(
+                    {"trace_id": metadata["trace_id"]}
+                    if isinstance(metadata, dict)
+                    and isinstance(metadata.get("trace_id"), str)
+                    and len(metadata["trace_id"]) <= 128
+                    else {}
+                ),
             )
             result = self._on_message_cb(msg)
             if asyncio.iscoroutine(result):
